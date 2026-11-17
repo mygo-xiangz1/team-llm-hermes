@@ -45,9 +45,8 @@ RUN set -eux; \
     rm -f /tmp/llama.tar.gz /tmp/cudart.tar.gz; \
     rm -rf /var/lib/apt/lists/*
 
-# No model weights are copied into the image. The template handler is inherited.
-# Its launch/import contract remains unverified because its repository is unavailable.
+# No model weights are copied into the image; the Global Volume provides them at runtime.
 WORKDIR /
 COPY server.py /server.py
 EXPOSE 8000
-CMD ["python3", "/handler/main.py"]
+CMD ["python3", "/server.py"]

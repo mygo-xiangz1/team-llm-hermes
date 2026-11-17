@@ -270,6 +270,20 @@ def filtered_headers(headers):
 
 
 async def forward(request: Request, path):
+    # Four-person team gate: TEAM_API_KEY_1..4 must be set, distinct and non-empty.
+    # Key accepted via X-API-Key or Authorization: Bearer (Hermes sends the latter).
+    keys = {os.getenv(f"TEAM_API_KEY_{i}", "") for i in range(1, 5)}
+    supplied = request.headers.get("x-api-key", "")
+    if not supplied:
+        authz = request.headers.get("authorization", "")
+        for pfx in ("Bearer ", "bearer "):
+            if authz.startswith(pfx):
+                supplied = authz[len(pfx):]
+    if len(keys) != 4 or "" in keys or supplied not in keys:
+        return JSONResponse(
+            {"error": {"message": "Invalid API key", "type": "authentication_error"}},
+            status_code=401,
+        )
     if not request.app.state.supervisor.ready.is_set():
         return JSONResponse({"message": "booting"}, status_code=503, headers={"Retry-After": "5"})
     body = await request.body()
