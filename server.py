@@ -240,6 +240,11 @@ async def root():
     return {"message": "ok"}
 
 
+@app.get("/ping")
+async def ping():
+    return {"message": "ok"}
+
+
 @app.get("/health")
 async def health(request: Request):
     # The template contract deliberately requires HTTP 200 even during cold loading.
