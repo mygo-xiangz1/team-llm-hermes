@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 LLAMA_URL = "http://127.0.0.1:8080"
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "1200"))
-DEFAULT_MODEL = "/data/models/Qwen3.8-Flash-Next-Uncensored-AD-3.86bpw-IQ4_XS-00001-of-00003.gguf"
+DEFAULT_MODEL = "/data/models/Qwen3.8-Flash-Next-Uncensored-AD-4.25bpw-Q4_K_M-00001-of-00003.gguf"
 DEFAULT_MMPROJ = "/data/models/mmproj-Qwen3.8-Flash-Next-Uncensored-BF16.gguf"
 DEFAULT_MTP = "/data/models/mtp-shared-Q8_0.gguf"
 HOP_HEADERS = {
