@@ -20,9 +20,6 @@ ARG CUDART_SHA256=75a12d227f44a391608992329241765343bd143ee9445b90dc62e154ee726e
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/ \
     LLAMA_BIN_DIR=/opt/llama.cpp \
-    MODEL_FILE=/data/models/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-MTP-00001-of-00003.gguf \
-    MMPROJ_FILE=/data/models/mmproj-Qwen3.8-Flash-Next-Uncensored-F16.gguf \
-    MODEL_ALIAS=team-hermes \
     REQUEST_TIMEOUT=1200
 
 # One RUN layer. Keep both archives' internal directory structure intact.
@@ -30,8 +27,9 @@ ENV PYTHONUNBUFFERED=1 \
 # root, not an assumed bin/ directory. server.py recursively finds llama-server
 # and its shared libraries; LLAMA_SERVER_BIN can explicitly select the binary.
 RUN set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl libgomp1; \
+    apt-get install -y --no-install-recommends ca-certificates curl libgomp1 python3 python3-pip; \
     python3 -m pip install --no-cache-dir 'fastapi>=0.115,<1' 'uvicorn>=0.30,<1' 'httpx>=0.27,<1'; \
     mkdir -p /opt/llama.cpp; \
     curl --fail --location --retry 5 --retry-all-errors \
