@@ -1,9 +1,11 @@
 # syntax=docker/dockerfile:1
 # Verified on 2026-11-17 against hub.docker.com API:
-# https://hub.docker.com/v2/repositories/nvidia/cuda/tags/12.8.1-cudnn-runtime-ubuntu22.04 -> 200
+# https://hub.docker.com/v2/repositories/nvidia/cuda/tags/12.8.1-cudnn-runtime-ubuntu24.04 -> 200
+# ubuntu24.04 (glibc 2.39, GLIBCXX 3.4.32) is required: llama.cpp b12359 prebuilt binaries
+# need GLIBC_2.38/GLIBCXX_3.4.32, absent from ubuntu22.04 (glibc 2.35) — worker crash-looped.
 # No RunPod handler needed: this endpoint is a LOAD BALANCER (HTTP) type, RunPod proxies
 # straight to the container port. server.py implements the health contract itself.
-ARG CUDA_TAG=12.8.1-cudnn-runtime-ubuntu22.04
+ARG CUDA_TAG=12.8.1-cudnn-runtime-ubuntu24.04
 FROM nvidia/cuda:${CUDA_TAG}
 
 # /releases/latest currently resolves to v1.0.0, which has only nightly-tag.txt.
