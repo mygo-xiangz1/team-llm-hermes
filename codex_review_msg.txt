@@ -1,0 +1,44 @@
+未修改文件。发现 **MTP 参数错误、SSE 连接清理缺口、首包前断连未处理**。指定 RunPod 模板的官方契约仍无法核实，不能据当前注释认定符合部署要求。
+
+**问题清单**
+
+1. **CRITICAL｜专用模板契约缺少可核验依据**  
+   位置：[server.py:1](<F:/TG Bot Bulid/team_llm/server.py:1>)、[server.py:242](<F:/TG Bot Bulid/team_llm/server.py:242>)、[server.py:357](<F:/TG Bot Bulid/team_llm/server.py:357>)；部署入口另见 [Dockerfile:52](<F:/TG Bot Bulid/team_llm/Dockerfile:52>)。  
+   实测 `runners/runpod_worker` 的 [GitHub API](https://api.github.com/repos/runners/runpod_worker) 和 [镜像接口](https://hub.docker.com/v2/repositories/runners/runpod-worker-cuda/) 均为 **404**。这不能证明其不存在，但意味着无法确认官方归属、8000 端口、四条路由及“booting 必须返回 200”的专用契约。Dockerfile 实际执行 `/handler/main.py`，它是否启动本文件也未证实。  
+   **修法：**取得可访问且固定版本的模板源码或镜像，核对 `/handler/main.py` 的启动、请求和健康检查协议，再据此适配。
+
+2. **CRITICAL（采用官方 Load Balancing 模式时）｜booting 返回 200 会被判断为健康**  
+   位置：[server.py:240](<F:/TG Bot Bulid/team_llm/server.py:240>)、[server.py:250](<F:/TG Bot Bulid/team_llm/server.py:250>)。  
+   当前 `/health` 在加载期间返回 `200 {"message":"booting"}`。官方 LB 按**状态码**判定：**200＝Healthy，204＝Initializing，其他＝Unhealthy**；JSON 中的 `booting` 不能阻止派发流量。[官方健康检查契约](https://docs.runpod.io/serverless/load-balancing/overview#health-checks)  
+   **修法：**若直接部署为官方 LB，初始化返回无正文的 `Response(status_code=204)`，就绪返回 200，并配置正确的健康检查路径。未知专用模板的要求需单独核实。
+
+3. **SHOULD｜启用 MTP 后必然遇到错误参数并退化为普通推理**  
+   位置：[server.py:91](<F:/TG Bot Bulid/team_llm/server.py:91>)、[server.py:191](<F:/TG Bot Bulid/team_llm/server.py:191>)、[server.py:195](<F:/TG Bot Bulid/team_llm/server.py:195>)。  
+   b12359 没有 `--spec-draft-max`，正确参数是 **`--spec-draft-n-max 4`**。当前 `SPEC_MTP=1` 时首次启动会失败，随后回退禁用 MTP；默认 `SPEC_MTP=0` 不触发此问题。[b12359 参数源码](https://github.com/ggml-org/llama.cpp/blob/b12359/common/arg.cpp#L4183)  
+   **修法：**替换参数名，并同步修正回退日志。
+
+4. **SHOULD｜SSE 清理依赖生成器运行，存在连接泄漏窗口**  
+   位置：[server.py:295](<F:/TG Bot Bulid/team_llm/server.py:295>)、[server.py:302](<F:/TG Bot Bulid/team_llm/server.py:302>)、[server.py:328](<F:/TG Bot Bulid/team_llm/server.py:328>)。  
+   上游连接先打开，成功流式响应在外层 `finally` 中跳过关闭，完全交给 `chunks()`。若发送响应头时断连，生成器尚未启动，其 `finally` 不执行；发送数据块时发生异常，也不保证立即关闭迭代器。连接可能持续占用连接池。HTTPX 要求手动流式模式保证最终执行 `aclose()`。[HTTPX 文档](https://www.python-httpx.org/async/#streaming-responses)  
+   **修法：**由自定义响应的 ASGI `__call__` 外层 `try/finally` 持有并关闭 `upstream`，清理使用取消屏蔽；覆盖未开始迭代、发送异常和取消路径。仅增加 `BackgroundTask` 不能覆盖所有异常路径。[Starlette 实现](https://github.com/encode/starlette/blob/0.42.0/starlette/responses.py#L252)
+
+5. **SHOULD｜等待上游响应头期间，没有下游断连监测**  
+   位置：[server.py:272](<F:/TG Bot Bulid/team_llm/server.py:272>)、[server.py:295](<F:/TG Bot Bulid/team_llm/server.py:295>)。  
+   请求体读取完成后直接等待 `client.send()`；此时 `StreamingResponse` 尚未返回，其断连处理尚未启动。客户端在排队或 prefill 时离开，当前代码仍可能继续等待并消耗上游资源。  
+   **修法：**并发监测 `http.disconnect`，断连后取消发送/读取任务，并在统一清理路径关闭已经取得的上游响应。
+
+**已核实的契约与正常项**
+
+| 检查项 | 核实结果 |
+|---|---|
+| RunPod 是否统一要求 FastAPI 监听 8000 | **没有该通用要求。**官方队列 worker 使用 `runpod.serverless.start({"handler": handler})`，无需自行实现这四条 HTTP 路由。[官方队列 worker 文档](https://docs.runpod.io/serverless/workers/handler-functions) |
+| 官方 LB 端口和路由 | `PORT`、`PORT_HEALTH` 分别默认 **80**；可配置为 8000，二者需与实际服务匹配。健康路径默认 `/ping`，可设置 `HEALTH_CHECK_PATH=/health`；业务路由自定义。[官方配置](https://docs.runpod.io/serverless/load-balancing/overview#environment-variables) |
+| 当前端口 | [server.py:357](<F:/TG Bot Bulid/team_llm/server.py:357>) 确实监听 `0.0.0.0:8000`；llama-server 在 `127.0.0.1:8080`。外部入口是否启动它仍待核实。 |
+| 当前四条路由 | 已实现 GET `/health`、POST `/handle_request`、GET `/ws`、GET `/get_status`。其中 [server.py:253](<F:/TG Bot Bulid/team_llm/server.py:253>) 的 `/ws` **只是 HTTP 占位接口，不是 WebSocket**；不能据路由名称判定协议合规。 |
+| `--spec-type draft-mtp` | **存在且拼写正确。**[b12359 speculative 源码](https://github.com/ggml-org/llama.cpp/blob/b12359/common/speculative.cpp#L76) |
+| Draft 数量参数 | 使用 `--spec-draft-n-max N`；`-n N` 控制生成 token 数。旧 `--draft`、`--draft-n`、`--draft-max` 在该版本已被移除。[参数源码](https://github.com/ggml-org/llama.cpp/blob/b12359/common/arg.cpp#L4455) |
+| Flash Attention | [server.py:73](<F:/TG Bot Bulid/team_llm/server.py:73>) 的 `on` 合法；**`on/off/auto` 三者均合法**，上游默认 `auto`。[b12359 README](https://github.com/ggml-org/llama.cpp/blob/b12359/tools/server/README.md) |
+| KV 容量与共享方式 | 当前显式 `--parallel 4 -c 262144`，未额外启用 unified 时，**按序列独立分配，每 slot 为 65,536 token**，总量 262,144。自动 slot 模式才会自动开启 unified；显式增加 `--kv-unified` 可改成共享总池。[server 默认处理](https://github.com/ggml-org/llama.cpp/blob/b12359/tools/server/server.cpp#L129)、[容量计算](https://github.com/ggml-org/llama.cpp/blob/b12359/src/llama-context.cpp#L411) |
+| HTTPX 正常路径 | 共享 `AsyncClient` 并在 lifespan 关闭；非流式分支有 `aclose()`；生成器已进入且在读取上游时被取消，会执行关闭；`aiter_raw()` 保留 SSE 原始字节。这些路径未发现遗漏关闭。 |
+
+验证采用只读源码检查、官方联网核验和内存模拟：复现了响应头/数据发送异常后的关闭缺口。语法检查通过；本机未安装完整服务依赖，未进行真实容器、网络断连或 GPU 推理测试。

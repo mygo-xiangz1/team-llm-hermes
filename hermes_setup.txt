@@ -1,0 +1,114 @@
+Hermes Agent 团队接入（三步，中文）
+核验日期：2026-11-17。服务端别名：team-hermes；每会话 context：65536。
+前提：管理员先解决 README 的镜像 tag 阻塞，并验证 RunPod OpenAI 网关可用。
+将下文 <ENDPOINT_ID> 和 <ENDPOINT_USER_TOKEN> 换成管理员分配给你的值。
+api_key 按团队约定用该 RunPod endpoint 的 user token，不填 endpoint_id。
+官方文档称此鉴权值为 RunPod API key；特定 user token 的权限待管理员验证。
+
+第一步：添加自定义 provider，并选中 team-hermes
+
+按需求保留的 settings.json / custom_providers 片段如下。
+【待验证】当前 Hermes 官方桌面版文档使用 config.yaml，未找到该 settings.json
+作为 provider 配置文件的官方依据。仅在你安装的版本明确支持此 schema 时合并，
+不要创建一个不会被应用读取的 settings.json 并以为已经生效。
+
+{
+  "custom_providers": [
+    {
+      "name": "team-runpod",
+      "base_url": "https://api.runpod.ai/v2/<ENDPOINT_ID>/openai/v1",
+      "api_key": "<ENDPOINT_USER_TOKEN>",
+      "api_mode": "chat_completions",
+      "model": "team-hermes",
+      "models": {
+        "team-hermes": { "context_length": 65536, "supports_vision": true }
+      }
+    }
+  ],
+  "model": { "provider": "custom:team-runpod", "default": "team-hermes" }
+}
+
+当前官方可依据的办法：桌面 Settings 的 provider/model 页面添加 Custom endpoint，
+填写同样的 URL、密钥和 model，并选中它；界面具体名称依版本而异。
+配置文件使用该实例/所选 profile 的 HERMES_HOME 下 config.yaml；通常是 ~/.hermes/，
+Windows 或多 profile 安装请从应用设置确认实际位置。官方配置示例：
+
+providers:
+  team-runpod:
+    api: https://api.runpod.ai/v2/<ENDPOINT_ID>/openai/v1
+    key_env: RUNPOD_ENDPOINT_USER_TOKEN
+    transport: chat_completions
+    default_model: team-hermes
+    models:
+      team-hermes:
+        context_length: 65536
+        supports_vision: true
+model:
+  provider: custom:team-runpod
+  default: team-hermes
+
+旧版支持的 custom_providers 是 config.yaml 中的列表；可把上面 JSON 的相同字段
+转换为 YAML。当前官方保留兼容并会迁移到 providers 字典。
+桌面选择模型；若当前界面支持 /model，可用 /model custom:team-runpod:team-hermes。
+不要给 alias 加 openai/ 前缀，也不要把 base_url 写到 /chat/completions。
+
+第二步：用 .env 设置/覆盖本人的连接信息
+
+把以下内容写到同一个 HERMES_HOME/profile 的 .env，重启该 Hermes 实例后生效。
+正式配置用上一步的 key_env 引用，直接覆盖这个变量即可换成本人的 user token：
+
+RUNPOD_ENDPOINT_USER_TOKEN=<ENDPOINT_USER_TOKEN>
+
+兼容旧版或通用 OpenAI provider 的 .env 覆盖写法：
+
+OPENAI_BASE_URL=https://api.runpod.ai/v2/<ENDPOINT_ID>/openai/v1
+OPENAI_API_KEY=<ENDPOINT_USER_TOKEN>
+
+【待验证】OPENAI_BASE_URL 是否覆盖已保存的 named custom provider，依 Hermes
+版本/provider 解析规则而异；不能假定它优先于 config.yaml 的 api/base_url。
+新版请在第一步修改 provider 的 api，model.default 固定设 team-hermes。
+不依赖未经当前版本确认的 OPENAI_MODEL 或 LLM_MODEL 变量来选择模型。
+如果 JSON 配置里写死了 api_key，.env 的 key_env 值可能不会覆盖；改用上述
+config.yaml/key_env 配置，或者在桌面界面更新密钥。
+
+首次先发短文本，再测试 stream 和一次工具调用；图片需要视觉塔成功加载。
+401/403 检查 user token 和 endpoint 权限；404 检查网关前缀及模板转发；
+503/booting 等模型就绪后重试，首次冷启动按 3–6 分钟预留（未实测）。
+客户端请求超时应允许 1200 秒；具体桌面版超时设置入口待验证。
+
+第三步：在 Hermes 调 reasoning / thinking
+
+当前官方桌面说明：输入框附近的模型选择器，悬停模型行可查看 thinking/effort；
+reasoning pill 可调整档位。若模型目录没有声明 reasoning 控制能力，此按钮会隐藏。
+team-hermes 自托管别名是否自动展示该控件：【待验证】。
+
+Hermes 支持 /reasoning none、/reasoning low、/reasoning medium、/reasoning high；
+也可以在 config.yaml 中设置：
+
+agent:
+  reasoning_effort: medium
+
+llama.cpp b12359 的请求接口文档已确认接受 reasoning_effort：none 关闭思考；
+其余值传给 Jinja 模板。low/medium/high 不保证在本 Qwen GGUF 中形成不同预算，
+该模型模板是否区分档位、Hermes 是否对该自定义模型发送字段：【待验证】。
+请用一条短请求检查实际请求字段及响应；不要把 UI 档位当作已测性能承诺。
+
+若需要显式控制模板布尔开关，当前 Hermes provider 支持 extra_body，例如在
+providers.team-runpod 下加入以下片段，然后重启/重新选择 provider：
+
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+
+设 true 尝试启用；具体 Qwen3.8 GGUF 模板采用 enable_thinking 还是
+thinking_enabled：【待验证】。这里展示的是 llama.cpp 文档的 enable_thinking。
+不要同时强制 extra_body=false 又调 /reasoning high；先移除固定布尔值再调档位。
+服务端默认不加 --chat-template-kwargs '{"thinking_enabled": true}'，也不强制
+全局开关；代理原样保留 Hermes 的 reasoning_effort、chat_template_kwargs 和工具字段。
+
+来源（官方）：
+https://github.com/NousResearch/hermes-agent/blob/main/website/docs/integrations/providers.md
+https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/desktop.md
+https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/configuration.md
+https://github.com/ggml-org/llama.cpp/blob/b12359/tools/server/README.md
+https://docs.runpod.io/integrations/overview

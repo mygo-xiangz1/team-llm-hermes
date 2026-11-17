@@ -1,0 +1,2701 @@
+Reading additional input from stdin...
+OpenAI Codex v0.164.0
+--------
+workdir: F:\TG Bot Bulid\team_llm
+model: gpt-6.1-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 01a1e7af-77c8-7e92-b0d9-63ac69020741
+--------
+user
+对当前目录 server.py 做部署前审查（不要改文件，可 curl 联网核验）：1) runpod 官方 serverless 模板 worker 契约：worker 容器内 FastAPI 必须监听哪个端口、必须实现哪些路由（/health /handle_request /ws /get_status），RunPod 官方 runpod worker 模板 runners/runpod_worker 的 GitHub/文档里 health 的返回契约是什么（booting 阶段 HTTP 状态码要求）。2) server.py 的 httpx 流式透传实现有无连接泄漏/断连清理问题。3) llama.cpp b12359 的 llama-server：--spec-type draft-mtp 与 --spec-draft-max 参数是否存在（从 llama.cpp GitHub 源码/文档确认，注意 --spec-draft-max 可能叫 --spec-draft-n-max 或 -n Draft），--flash-attn 取值 on/off/auto 哪个正确，--parallel 4 -c 262144 时 KV 池是共享还是每 slot 独立（查 llama.cpp docs/multimodule 或 server README）。输出问题清单（CRITICAL/SHOULD/MINOR + 文件行号 + 修法），没有问题的项也要列出'已核实'。
+codex
+我会先读取 `server.py` 和仓库审查规则，再核对 RunPod、llama.cpp b12359 的官方资料；只审查，不修改文件。
+web search: 
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "Get-Location; rg --files -g AGENTS.md -g server.py -g '*runpod*' -g '*Dockerfile*' -g 'requirements*.txt' -g 'pyproject.toml'" in F:\TG Bot Bulid\team_llm
+ succeeded in 425ms:
+
+server.py
+Dockerfile
+Path                    
+----                    
+F:\TG Bot Bulid\team_llm
+
+
+
+web search: RunPod runners/runpod_worker handle_request get_status health booting ...
+web search: 
+web search: 
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command '$candidates = @('"'F:\\AGENTS.md','F:\\TG Bot Bulid\\AGENTS.md','F:\\TG Bot Bulid\\team_llm\\AGENTS.md'); foreach ("'$path in $candidates) { if (Test-Path -LiteralPath $path) { Write-Output "FILE $path"; Get-Content -LiteralPath $path } }; $line = 0; Get-Content -LiteralPath server.py | ForEach-Object { $line++; '"'{0,4}: {1}' -f "'$line, $_ }; $line = 0; Get-Content -LiteralPath Dockerfile | ForEach-Object { $line++; '"'{0,4}: {1}' -f "'$line, $_ }; git status --short' in F:\TG Bot Bulid\team_llm
+ succeeded in 530ms:
+   1: """RunPod template HTTP contract on :8000; supervised llama-server on loopback :8080."""
+   2: 
+   3: import asyncio
+   4: from contextlib import asynccontextmanager
+   5: import json
+   6: import os
+   7: from pathlib import Path
+   8: import re
+   9: import shlex
+  10: import subprocess
+  11: import threading
+  12: import time
+  13: import urllib.error
+  14: import urllib.request
+  15: 
+  16: import httpx
+  17: from fastapi import FastAPI, Request
+  18: from fastapi.responses import JSONResponse, Response, StreamingResponse
+  19: 
+  20: 
+  21: LLAMA_URL = "http://127.0.0.1:8080"
+  22: REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "1200"))
+  23: DEFAULT_MODEL = "/data/models/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-MTP-00001-of-00003.gguf"
+  24: DEFAULT_MMPROJ = "/data/models/mmproj-Qwen3.8-Flash-Next-Uncensored-F16.gguf"
+  25: HOP_HEADERS = {
+  26:     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+  27:     "te", "trailer", "transfer-encoding", "upgrade", "content-length",
+  28: }
+  29: 
+  30: 
+  31: def log(message):
+  32:     print(message, flush=True)
+  33: 
+  34: 
+  35: def model_path(value):
+  36:     """Honor /data; also support Serverless's documented /runpod-volume mount."""
+  37:     path = Path(value)
+  38:     if not path.is_file() and value.startswith("/data/"):
+  39:         root = os.getenv("VOLUME_FALLBACK_ROOT", "/runpod-volume")
+  40:         alternative = Path(root) / value.removeprefix("/data/") if root else path
+  41:         if alternative.is_file():
+  42:             log(f"[volume] {path} -> {alternative}")
+  43:             path = alternative
+  44:     if not path.is_file():
+  45:         raise FileNotFoundError(f"Model file missing: {path}; check the volume mount")
+  46:     return path
+  47: 
+  48: 
+  49: def find_binary():
+  50:     explicit = os.getenv("LLAMA_SERVER_BIN", "")
+  51:     root = Path(os.getenv("LLAMA_BIN_DIR", "/opt/llama.cpp"))
+  52:     candidates = [Path(explicit)] if explicit else sorted(root.rglob("llama-server"))
+  53:     candidates = sorted({p.resolve() for p in candidates if p.is_file() and os.access(p, os.X_OK)})
+  54:     if len(candidates) != 1:
+  55:         raise RuntimeError(f"Expected one executable llama-server under {root}; set LLAMA_SERVER_BIN")
+  56:     return candidates[0], root
+  57: 
+  58: 
+  59: def command(use_mtp):
+  60:     binary, root = find_binary()
+  61:     model = model_path(os.getenv("MODEL_FILE", DEFAULT_MODEL))
+  62:     split = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", model.name)
+  63:     if split:
+  64:         prefix, _, count = split.groups()
+  65:         for index in range(1, int(count) + 1):
+  66:             shard = model.with_name(f"{prefix}-{index:05d}-of-{count}.gguf")
+  67:             if not shard.is_file():
+  68:                 raise FileNotFoundError(f"GGUF shard missing: {shard}")
+  69:     args = [
+  70:         str(binary), "--host", "127.0.0.1", "--port", "8080",
+  71:         "--model", str(model), "--alias", os.getenv("MODEL_ALIAS", "team-hermes"),
+  72:         "-ngl", os.getenv("N_GPU_LAYERS", "99"),
+  73:         "--flash-attn", os.getenv("FLASH_ATTN", "on"),
+  74:         "-c", os.getenv("CTX_SIZE", "262144"),
+  75:         "--parallel", os.getenv("PARALLEL", "4"),
+  76:         "--cache-type-k", os.getenv("CACHE_TYPE_K", "q8_0"),
+  77:         "--cache-type-v", os.getenv("CACHE_TYPE_V", "q8_0"),
+  78:         "--timeout", str(int(REQUEST_TIMEOUT)), "--jinja",
+  79:     ]
+  80:     mmproj = os.getenv("MMPROJ_FILE", DEFAULT_MMPROJ)
+  81:     if mmproj:
+  82:         args += ["--mmproj", str(model_path(mmproj))]
+  83:     # Deliberately no default --chat-template-kwargs: Hermes owns per-request thinking.
+  84:     kwargs = os.getenv("CHAT_TEMPLATE_KWARGS", "").strip()
+  85:     if kwargs:
+  86:         if not isinstance(json.loads(kwargs), dict):
+  87:             raise ValueError("CHAT_TEMPLATE_KWARGS must be a JSON object")
+  88:         args += ["--chat-template-kwargs", kwargs]
+  89:     args += shlex.split(os.getenv("LLAMA_EXTRA_ARGS", ""))
+  90:     if use_mtp:
+  91:         args += ["--spec-type", "draft-mtp", "--spec-draft-max", os.getenv("SPEC_DRAFT_MAX", "4")]
+  92:     child_env = os.environ.copy()
+  93:     lib_dirs = sorted({str(p.parent) for p in root.rglob("*.so*") if p.is_file()})
+  94:     child_env["LD_LIBRARY_PATH"] = ":".join(
+  95:         [str(binary.parent), *lib_dirs, child_env.get("LD_LIBRARY_PATH", "")]
+  96:     )
+  97:     return args, child_env, binary.parent
+  98: 
+  99: 
+ 100: class LlamaSupervisor:
+ 101:     def __init__(self):
+ 102:         self.ready = threading.Event()
+ 103:         self.stopping = threading.Event()
+ 104:         self.lock = threading.Lock()
+ 105:         self.process = None
+ 106:         self.thread = None
+ 107:         # Never send local readiness probes through an HTTP_PROXY from the environment.
+ 108:         self.probe = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+ 109: 
+ 110:     def start(self):
+ 111:         self.thread = threading.Thread(target=self.run, name="llama-supervisor", daemon=True)
+ 112:         self.thread.start()
+ 113: 
+ 114:     def backend_ready(self):
+ 115:         try:
+ 116:             with self.probe.open(f"{LLAMA_URL}/health", timeout=2) as response:
+ 117:                 return response.status == 200
+ 118:         except (OSError, urllib.error.URLError):
+ 119:             return False
+ 120: 
+ 121:     @staticmethod
+ 122:     def read_logs(process):
+ 123:         with process.stdout:
+ 124:             for line in process.stdout:
+ 125:                 log(f"[llama] {line.rstrip()}")
+ 126: 
+ 127:     @staticmethod
+ 128:     def terminate(process):
+ 129:         if process is not None and process.poll() is None:
+ 130:             try:
+ 131:                 process.terminate()
+ 132:                 process.wait(timeout=15)
+ 133:             except subprocess.TimeoutExpired:
+ 134:                 process.kill()
+ 135:                 process.wait(timeout=5)
+ 136:             except ProcessLookupError:
+ 137:                 pass
+ 138: 
+ 139:     def run(self):
+ 140:         use_mtp = os.getenv("SPEC_MTP", "0") == "1"
+ 141:         fallback_used = False
+ 142:         initial = max(1.0, float(os.getenv("RESTART_INITIAL_SECONDS", "2")))
+ 143:         maximum = max(initial, float(os.getenv("RESTART_MAX_SECONDS", "60")))
+ 144:         delay = initial
+ 145:         startup_timeout = float(os.getenv("LLAMA_STARTUP_TIMEOUT", "1200"))
+ 146:         while not self.stopping.is_set():
+ 147:             process = None
+ 148:             was_ready = False
+ 149:             first_ready = None
+ 150:             self.ready.clear()
+ 151:             try:
+ 152:                 args, child_env, cwd = command(use_mtp)
+ 153:                 log(f"[supervisor] starting {args[0]} (MTP={use_mtp}, ctx={os.getenv('CTX_SIZE', '262144')})")
+ 154:                 # Start while holding the lock so shutdown cannot miss a newly created child.
+ 155:                 with self.lock:
+ 156:                     if self.stopping.is_set():
+ 157:                         break
+ 158:                     process = subprocess.Popen(
+ 159:                         args, env=child_env, cwd=cwd, stdout=subprocess.PIPE,
+ 160:                         stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+ 161:                         errors="replace", bufsize=1,
+ 162:                     )
+ 163:                     self.process = process
+ 164:                 threading.Thread(target=self.read_logs, args=(process,), daemon=True).start()
+ 165:                 started = time.monotonic()
+ 166:                 while not self.stopping.is_set() and process.poll() is None:
+ 167:                     if self.backend_ready():
+ 168:                         self.ready.set()
+ 169:                         if not was_ready:
+ 170:                             first_ready = time.monotonic()
+ 171:                             was_ready = True
+ 172:                             log("[supervisor] llama-server ready")
+ 173:                     else:
+ 174:                         self.ready.clear()
+ 175:                     if not was_ready and time.monotonic() - started > startup_timeout:
+ 176:                         log(f"[supervisor] startup exceeded {startup_timeout:g}s; terminating")
+ 177:                         self.terminate(process)
+ 178:                         break
+ 179:                     self.stopping.wait(1)
+ 180:                 if not self.stopping.is_set():
+ 181:                     log(f"[supervisor] llama-server exited: {process.poll()}")
+ 182:             except Exception as exc:
+ 183:                 log(f"[supervisor] startup/monitor failure: {type(exc).__name__}: {exc}")
+ 184:             finally:
+ 185:                 self.ready.clear()
+ 186:                 self.terminate(process)
+ 187:                 with self.lock:
+ 188:                     self.process = None
+ 189:             if self.stopping.is_set():
+ 190:                 break
+ 191:             if use_mtp and not was_ready and not fallback_used:
+ 192:                 # Exactly one immediate startup retry without BOTH speculative flags.
+ 193:                 use_mtp = False
+ 194:                 fallback_used = True
+ 195:                 log("[supervisor] retrying once without --spec-type / --spec-draft-max")
+ 196:                 continue
+ 197:             if first_ready is not None and time.monotonic() - first_ready >= 60:
+ 198:                 delay = initial
+ 199:             log(f"[supervisor] restart in {delay:g}s")
+ 200:             self.stopping.wait(delay)
+ 201:             delay = min(delay * 2, maximum)
+ 202: 
+ 203:     def close(self):
+ 204:         self.stopping.set()
+ 205:         self.ready.clear()
+ 206:         # run() owns termination, avoiding two threads signalling the same process.
+ 207:         if self.thread is not None:
+ 208:             self.thread.join(timeout=30)
+ 209: 
+ 210: 
+ 211: @asynccontextmanager
+ 212: async def lifespan(app):
+ 213:     supervisor = LlamaSupervisor()
+ 214:     app.state.supervisor = supervisor
+ 215:     app.state.client = httpx.AsyncClient(
+ 216:         timeout=httpx.Timeout(REQUEST_TIMEOUT), trust_env=False,
+ 217:         limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+ 218:     )
+ 219:     supervisor.start()
+ 220:     log("[proxy] listening on 0.0.0.0:8000; loading llama-server in background")
+ 221:     try:
+ 222:         yield
+ 223:     finally:
+ 224:         await asyncio.to_thread(supervisor.close)
+ 225:         await app.state.client.aclose()
+ 226: 
+ 227: 
+ 228: app = FastAPI(lifespan=lifespan)
+ 229: 
+ 230: 
+ 231: def api_error(message, status, kind="upstream_error"):
+ 232:     return JSONResponse({"error": {"message": message, "type": kind}}, status_code=status)
+ 233: 
+ 234: 
+ 235: @app.get("/")
+ 236: async def root():
+ 237:     return {"message": "ok"}
+ 238: 
+ 239: 
+ 240: @app.get("/health")
+ 241: async def health(request: Request):
+ 242:     # The template contract deliberately requires HTTP 200 even during cold loading.
+ 243:     if request.app.state.supervisor.ready.is_set():
+ 244:         try:
+ 245:             response = await request.app.state.client.get(f"{LLAMA_URL}/health", timeout=2)
+ 246:             if response.status_code == 200:
+ 247:                 return {"message": "ready"}
+ 248:         except httpx.HTTPError:
+ 249:             pass
+ 250:     return {"message": "booting"}
+ 251: 
+ 252: 
+ 253: @app.get("/ws")
+ 254: async def ws_stub():
+ 255:     return {"message": "stub"}
+ 256: 
+ 257: 
+ 258: @app.get("/get_status")
+ 259: async def status_stub(request: Request):
+ 260:     return {"status": "ready" if request.app.state.supervisor.ready.is_set() else "booting"}
+ 261: 
+ 262: 
+ 263: def filtered_headers(headers):
+ 264:     connection_tokens = {token.strip().lower() for token in headers.get("connection", "").split(",")}
+ 265:     excluded = HOP_HEADERS | connection_tokens
+ 266:     return {key: value for key, value in headers.items() if key.lower() not in excluded}
+ 267: 
+ 268: 
+ 269: async def forward(request: Request, path):
+ 270:     if not request.app.state.supervisor.ready.is_set():
+ 271:         return JSONResponse({"message": "booting"}, status_code=503, headers={"Retry-After": "5"})
+ 272:     body = await request.body()
+ 273:     streaming = False
+ 274:     if request.method == "POST":
+ 275:         try:
+ 276:             payload = json.loads(body)
+ 277:         except (ValueError, UnicodeDecodeError):
+ 278:             return api_error("Request body must be a JSON object", 400, "invalid_request_error")
+ 279:         if not isinstance(payload, dict):
+ 280:             return api_error("Request body must be a JSON object", 400, "invalid_request_error")
+ 281:         streaming = payload.get("stream") is True
+ 282:     headers = filtered_headers(request.headers)
+ 283:     # RunPod authenticates the user token; do not send that credential to llama-server.
+ 284:     for key in ("host", "authorization", "cookie", "accept-encoding"):
+ 285:         headers.pop(key, None)
+ 286:     headers["accept-encoding"] = "identity"
+ 287:     client = request.app.state.client
+ 288:     upstream = None
+ 289:     try:
+ 290:         outgoing = client.build_request(
+ 291:             request.method, f"{LLAMA_URL}{path}", content=body,
+ 292:             params=request.query_params.multi_items(), headers=headers,
+ 293:         )
+ 294:         # Open outside the generator so upstream status/errors arrive before HTTP headers.
+ 295:         upstream = await client.send(outgoing, stream=True)
+ 296:         response_headers = filtered_headers(upstream.headers)
+ 297:         is_sse = "text/event-stream" in upstream.headers.get("content-type", "").lower()
+ 298:         if upstream.is_success and (streaming or is_sse):
+ 299:             response_headers["cache-control"] = "no-cache"
+ 300:             response_headers["x-accel-buffering"] = "no"
+ 301: 
+ 302:             async def chunks():
+ 303:                 try:
+ 304:                     # Raw bytes preserve SSE lines, blank separators, tool/reasoning deltas,
+ 305:                     # and the upstream data: [DONE] terminator, without JSON re-encoding.
+ 306:                     async for chunk in upstream.aiter_raw():
+ 307:                         yield chunk
+ 308:                 except httpx.HTTPError as exc:
+ 309:                     log(f"[proxy] SSE interrupted: {type(exc).__name__}")
+ 310:                     raise  # Never fabricate [DONE] after a broken stream.
+ 311:                 finally:
+ 312:                     await asyncio.shield(upstream.aclose())
+ 313: 
+ 314:             return StreamingResponse(
+ 315:                 chunks(), status_code=upstream.status_code,
+ 316:                 headers=response_headers, media_type="text/event-stream",
+ 317:             )
+ 318:         content = await upstream.aread()
+ 319:         # aread() decodes content encodings; do not retain a stale encoding header.
+ 320:         response_headers.pop("content-encoding", None)
+ 321:         return Response(content=content, status_code=upstream.status_code, headers=response_headers)
+ 322:     except httpx.TimeoutException:
+ 323:         log("[proxy] llama-server request timed out")
+ 324:         return api_error("llama-server request timed out", 504, "upstream_timeout")
+ 325:     except httpx.HTTPError as exc:
+ 326:         log(f"[proxy] llama-server connection failed: {type(exc).__name__}")
+ 327:         return api_error("llama-server is unavailable", 502)
+ 328:     finally:
+ 329:         # Successful SSE owns its response until the iterator closes it.
+ 330:         if upstream is not None and (not upstream.is_success or not (streaming or is_sse)):
+ 331:             await upstream.aclose()
+ 332: 
+ 333: 
+ 334: @app.post("/handle_request")
+ 335: async def handle_request(request: Request):
+ 336:     # The template passes the entire OpenAI body here; do not unwrap an "input" field.
+ 337:     return await forward(request, "/v1/chat/completions")
+ 338: 
+ 339: 
+ 340: async def openai_proxy(request: Request):
+ 341:     return await forward(request, request.url.path)
+ 342: 
+ 343: 
+ 344: for route, method in (
+ 345:     ("/v1/models", "GET"),
+ 346:     ("/v1/chat/completions", "POST"),
+ 347:     ("/v1/completions", "POST"),
+ 348:     ("/v1/embeddings", "POST"),
+ 349: ):
+ 350:     app.add_api_route(route, openai_proxy, methods=[method])
+ 351: 
+ 352: 
+ 353: if __name__ == "__main__":
+ 354:     import uvicorn
+ 355: 
+ 356:     # Exactly one ASGI worker: multiple workers would start competing llama processes.
+ 357:     uvicorn.run(app, host="0.0.0.0", port=8000, workers=1, access_log=False)
+   1: # syntax=docker/dockerfile:1
+   2: # BLOCKER (checked 2026-11-17): the requested Docker Hub tags API returns 404:
+   3: # https://hub.docker.com/v2/repositories/runners/runpod-worker-cuda/tags?page_size=100
+   4: # Supply a verified cu12.x tag with --build-arg RUNPOD_CUDA_TAG=...; no invented default.
+   5: ARG RUNPOD_CUDA_TAG
+   6: FROM runners/runpod-worker-cuda:${RUNPOD_CUDA_TAG}
+   7: 
+   8: # /releases/latest currently resolves to v1.0.0, which has only nightly-tag.txt.
+   9: # That release explicitly links b12359. Its real Linux x86_64 CUDA 12.8 assets:
+  10: # https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz
+  11: # https://github.com/ggml-org/llama.cpp/releases/download/b12359/cudart-llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz
+  12: # Pin the linked build and the API-reported SHA256 values for reproducibility.
+  13: ARG LLAMA_RELEASE=b12359
+  14: ARG LLAMA_ARCHIVE=llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz
+  15: ARG LLAMA_SHA256=50c937bec5bbd9f74c99138034f7403283ee21f1943f2429d7b1e4c079eafc11
+  16: ARG CUDART_ARCHIVE=cudart-llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz
+  17: ARG CUDART_SHA256=75a12d227f44a391608992329241765343bd143ee9445b90dc62e154ee726e5d
+  18: 
+  19: ENV PYTHONUNBUFFERED=1 \
+  20:     PYTHONPATH=/ \
+  21:     LLAMA_BIN_DIR=/opt/llama.cpp \
+  22:     MODEL_FILE=/data/models/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-MTP-00001-of-00003.gguf \
+  23:     MMPROJ_FILE=/data/models/mmproj-Qwen3.8-Flash-Next-Uncensored-F16.gguf \
+  24:     MODEL_ALIAS=team-hermes \
+  25:     REQUEST_TIMEOUT=1200
+  26: 
+  27: # One RUN layer. Keep both archives' internal directory structure intact.
+  28: # Archive contents were NOT downloaded/inspected locally: LLAMA_BIN_DIR is a search
+  29: # root, not an assumed bin/ directory. server.py recursively finds llama-server
+  30: # and its shared libraries; LLAMA_SERVER_BIN can explicitly select the binary.
+  31: RUN set -eux; \
+  32:     apt-get update; \
+  33:     apt-get install -y --no-install-recommends ca-certificates curl libgomp1; \
+  34:     python3 -m pip install --no-cache-dir 'fastapi>=0.115,<1' 'uvicorn>=0.30,<1' 'httpx>=0.27,<1'; \
+  35:     mkdir -p /opt/llama.cpp; \
+  36:     curl --fail --location --retry 5 --retry-all-errors \
+  37:         "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/${LLAMA_ARCHIVE}" -o /tmp/llama.tar.gz; \
+  38:     curl --fail --location --retry 5 --retry-all-errors \
+  39:         "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/${CUDART_ARCHIVE}" -o /tmp/cudart.tar.gz; \
+  40:     printf '%s  %s\n' "$LLAMA_SHA256" /tmp/llama.tar.gz "$CUDART_SHA256" /tmp/cudart.tar.gz | sha256sum --check -; \
+  41:     tar -xzf /tmp/llama.tar.gz -C /opt/llama.cpp; \
+  42:     tar -xzf /tmp/cudart.tar.gz -C /opt/llama.cpp; \
+  43:     find /opt/llama.cpp -type f -name llama-server -exec chmod +x {} \;; \
+  44:     rm -f /tmp/llama.tar.gz /tmp/cudart.tar.gz; \
+  45:     rm -rf /var/lib/apt/lists/*
+  46: 
+  47: # No model weights are copied into the image. The template handler is inherited.
+  48: # Its launch/import contract remains unverified because its repository is unavailable.
+  49: WORKDIR /
+  50: COPY server.py /server.py
+  51: EXPOSE 8000
+  52: CMD ["python3", "/handler/main.py"]
+ M ../__pycache__/comfy_watchdog.cpython-313.pyc
+ M ../__pycache__/comfy_watchdog.cpython-314.pyc
+ M ../__pycache__/pelvis_inpaint.cpython-313.pyc
+ M ../__pycache__/pelvis_inpaint.cpython-314.pyc
+ M ../__pycache__/prompt_writer.cpython-313.pyc
+ M ../__pycache__/prompt_writer.cpython-314.pyc
+ M ../__pycache__/qa_gate.cpython-313.pyc
+ M ../__pycache__/qa_gate.cpython-314.pyc
+ M ../__pycache__/recon_pipeline.cpython-313.pyc
+ M ../__pycache__/recon_pipeline.cpython-314.pyc
+ M ../__pycache__/run_one.cpython-313.pyc
+ M ../__pycache__/run_one.cpython-314.pyc
+ M ../__pycache__/runpod_client.cpython-313.pyc
+ M ../__pycache__/runpod_client.cpython-314.pyc
+ M ../__pycache__/think_knob.cpython-313.pyc
+ M ../__pycache__/think_knob.cpython-314.pyc
+ M ../__pycache__/view_router.cpython-314.pyc
+ M ../tg_bot/__pycache__/admin_server.cpython-314.pyc
+ M ../tg_bot/__pycache__/bot.cpython-313.pyc
+ M ../tg_bot/__pycache__/bot.cpython-314.pyc
+ M ../tg_bot/__pycache__/store.cpython-313.pyc
+ M ../tg_bot/__pycache__/store.cpython-314.pyc
+ M ../tg_bot/__pycache__/workshop_gen.cpython-313.pyc
+ M ../tg_bot/__pycache__/workshop_gen.cpython-314.pyc
+ M ../tg_bot/config.json
+ M ../tg_bot/tg_data.db
+?? "../SPECTRA_\346\210\220\346\234\254\347\233\210\345\210\251\346\250\241\345\236\213_v1.1_20261115.html"
+?? "../SPECTRA_\346\210\220\346\234\254\347\233\210\345\210\251\346\250\241\345\236\213_v1_20261115.html"
+?? ../__pycache__/test_gate_invariants.cpython-313.pyc
+?? ../__pycache__/test_pathutil.cpython-313.pyc
+?? ../__pycache__/test_runtime_safety.cpython-313.pyc
+?? ../codex_build_log.txt
+?? ../codex_build_msg.txt
+?? ../codex_last_pathclean.txt
+?? ../codex_out_pathclean_20261115.log
+?? ../scratch/ax42_config.json
+?? ../scratch/ax42_live/config2.json
+?? ../scratch/codex_review.txt
+?? ../scratch/cost_model/
+?? ../scratch/deploy3/
+?? ../scratch/deploy4/
+?? ../scratch/e2e_paths_1372_out.png
+?? ../scratch/e2e_paths_job.py
+?? ../scratch/git_config.json
+?? ../scratch/monitors/.qa/
+?? ../scratch/monitors/TASK4.md
+?? ../scratch/monitors/codex4.log
+?? ../scratch/q_failed.py
+?? ../scratch/t_out.txt
+?? ./
+?? ../team_llm_infra.json
+?? ../tg_bot/__pycache__/gallery.cpython-313.pyc
+?? ../tg_bot/__pycache__/migrate_paths_20261115.cpython-313.pyc
+?? ../tg_bot/__pycache__/notify_broadcast.cpython-313.pyc
+?? ../tg_bot/__pycache__/pathutil.cpython-313.pyc
+?? ../tg_bot/__pycache__/pathutil.cpython-314.pyc
+?? ../tg_bot/__pycache__/peak.cpython-313.pyc
+?? ../tg_bot/__pycache__/peak.cpython-314.pyc
+?? ../tg_bot/__pycache__/test_gallery.cpython-313.pyc
+?? ../tg_bot/__pycache__/test_gate_invariants.cpython-314.pyc
+?? ../tg_bot/__pycache__/test_prewarm.cpython-313.pyc
+?? ../tg_bot/__pycache__/test_progress.cpython-313.pyc
+?? ../tg_bot/config.json.bak-price-20261115
+
+web search: https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/common/arg.cpp
+web search: site:github.com/runpod "runners/runpod_worker" ...
+web search: 
+web search: site:github.com/runpod "runners/runpod_worker" ...
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command '$line = 0; Get-Content -LiteralPath Dockerfile | ForEach-Object { $line++; if ($line -ge 27) { '"'{0,4}: {1}' -f "'$line, $_ } }; rg --files -g '"'"'!*.lock'"' -g '"'!node_modules/**'"' -g '"'!venv/**'"'; python -c \"import importlib.metadata as m; print({p: m.version(p) for p in ['httpx','starlette','fastapi','anyio','uvicorn']})\"" in F:\TG Bot Bulid\team_llm
+ exited 1 in 573ms:
+  27: # One RUN layer. Keep both archives' internal directory structure intact.
+  28: # Archive contents were NOT downloaded/inspected locally: LLAMA_BIN_DIR is a search
+  29: # root, not an assumed bin/ directory. server.py recursively finds llama-server
+  30: # and its shared libraries; LLAMA_SERVER_BIN can explicitly select the binary.
+  31: RUN set -eux; \
+  32:     apt-get update; \
+  33:     apt-get install -y --no-install-recommends ca-certificates curl libgomp1; \
+  34:     python3 -m pip install --no-cache-dir 'fastapi>=0.115,<1' 'uvicorn>=0.30,<1' 'httpx>=0.27,<1'; \
+  35:     mkdir -p /opt/llama.cpp; \
+  36:     curl --fail --location --retry 5 --retry-all-errors \
+  37:         "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/${LLAMA_ARCHIVE}" -o /tmp/llama.tar.gz; \
+  38:     curl --fail --location --retry 5 --retry-all-errors \
+  39:         "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/${CUDART_ARCHIVE}" -o /tmp/cudart.tar.gz; \
+  40:     printf '%s  %s\n' "$LLAMA_SHA256" /tmp/llama.tar.gz "$CUDART_SHA256" /tmp/cudart.tar.gz | sha256sum --check -; \
+  41:     tar -xzf /tmp/llama.tar.gz -C /opt/llama.cpp; \
+  42:     tar -xzf /tmp/cudart.tar.gz -C /opt/llama.cpp; \
+  43:     find /opt/llama.cpp -type f -name llama-server -exec chmod +x {} \;; \
+  44:     rm -f /tmp/llama.tar.gz /tmp/cudart.tar.gz; \
+  45:     rm -rf /var/lib/apt/lists/*
+  46: 
+  47: # No model weights are copied into the image. The template handler is inherited.
+  48: # Its launch/import contract remains unverified because its repository is unavailable.
+  49: WORKDIR /
+  50: COPY server.py /server.py
+  51: EXPOSE 8000
+  52: CMD ["python3", "/handler/main.py"]
+server.py
+README.md
+hermes_setup.txt
+Dockerfile
+codex_review_log.txt
+Traceback (most recent call last):
+  File "C:\Users\xiangz\AppData\Local\hermes\tools\python-3.14.7+20260901-win32-x64\Lib\importlib\metadata\__init__.py", line 407, in from_name
+    return next(iter(cls.discover(name=name)))
+StopIteration
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import importlib.metadata as m; print({p: m.version(p) for p in ['httpx','starlette','fastapi','anyio','uvicorn']})
+                                              ~~~~~~~~~^^^
+  File "C:\Users\xiangz\AppData\Local\hermes\tools\python-3.14.7+20260901-win32-x64\Lib\importlib\metadata\__init__.py", line 987, in version
+    return distribution(distribution_name).version
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\xiangz\AppData\Local\hermes\tools\python-3.14.7+20260901-win32-x64\Lib\importlib\metadata\__init__.py", line 960, in distribution
+    return Distribution.from_name(distribution_name)
+           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\xiangz\AppData\Local\hermes\tools\python-3.14.7+20260901-win32-x64\Lib\importlib\metadata\__init__.py", line 409, in from_name
+    raise PackageNotFoundError(name)
+importlib.metadata.PackageNotFoundError: No package metadata was found for httpx
+
+web search: 
+web search: 
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "rg -n -i 'github|runpod.worker|contract|booting|health|spec|kv|parallel|8000' README.md codex_review_log.txt hermes_setup.txt; curl.exe -L -sS -w '\\nHTTP %{http_code}\\n' --max-time 25 https://api.github.com/repos/runners/runpod_worker" in F:\TG Bot Bulid\team_llm
+ succeeded in 1910ms:
+hermes_setup.txt:76:503/booting 等模型就绪后重试，首次冷启动按 3–6 分钟预留（未实测）。
+hermes_setup.txt:110:https://github.com/NousResearch/hermes-agent/blob/main/website/docs/integrations/providers.md
+hermes_setup.txt:111:https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/desktop.md
+hermes_setup.txt:112:https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/configuration.md
+hermes_setup.txt:113:https://github.com/ggml-org/llama.cpp/blob/b12359/tools/server/README.md
+codex_review_log.txt:14:对当前目录 server.py 做部署前审查（不要改文件，可 curl 联网核验）：1) runpod 官方 serverless 模板 worker 契约：worker 容器内 FastAPI 必须监听哪个端口、必须实现哪些路由（/health /handle_request /ws /get_status），RunPod 官方 runpod worker 模板 runners/runpod_worker 的 GitHub/文档里 health 的返回契约是什么（booting 阶段 HTTP 状态码要求）。2) server.py 的 httpx 流式透传实现有无连接泄漏/断连清理问题。3) llama.cpp b12359 的 llama-server：--spec-type draft-mtp 与 --spec-draft-max 参数是否存在（从 llama.cpp GitHub 源码/文档确认，注意 --spec-draft-max 可能叫 --spec-draft-n-max 或 -n Draft），--flash-attn 取值 on/off/auto 哪个正确，--parallel 4 -c 262144 时 KV 池是共享还是每 slot 独立（查 llama.cpp docs/multimodule 或 server README）。输出问题清单（CRITICAL/SHOULD/MINOR + 文件行号 + 修法），没有问题的项也要列出'已核实'。
+codex_review_log.txt:30:web search: RunPod runners/runpod_worker handle_request get_status health booting ...
+codex_review_log.txt:36:   1: """RunPod template HTTP contract on :8000; supervised llama-server on loopback :8080."""
+codex_review_log.txt:110:  75:         "--parallel", os.getenv("PARALLEL", "4"),
+codex_review_log.txt:126:  91:         args += ["--spec-type", "draft-mtp", "--spec-draft-max", os.getenv("SPEC_DRAFT_MAX", "4")]
+codex_review_log.txt:151: 116:             with self.probe.open(f"{LLAMA_URL}/health", timeout=2) as response:
+codex_review_log.txt:175: 140:         use_mtp = os.getenv("SPEC_MTP", "0") == "1"
+codex_review_log.txt:227: 192:                 # Exactly one immediate startup retry without BOTH speculative flags.
+codex_review_log.txt:230: 195:                 log("[supervisor] retrying once without --spec-type / --spec-draft-max")
+codex_review_log.txt:255: 220:     log("[proxy] listening on 0.0.0.0:8000; loading llama-server in background")
+codex_review_log.txt:275: 240: @app.get("/health")
+codex_review_log.txt:276: 241: async def health(request: Request):
+codex_review_log.txt:277: 242:     # The template contract deliberately requires HTTP 200 even during cold loading.
+codex_review_log.txt:280: 245:             response = await request.app.state.client.get(f"{LLAMA_URL}/health", timeout=2)
+codex_review_log.txt:285: 250:     return {"message": "booting"}
+codex_review_log.txt:295: 260:     return {"status": "ready" if request.app.state.supervisor.ready.is_set() else "booting"}
+codex_review_log.txt:306: 271:         return JSONResponse({"message": "booting"}, status_code=503, headers={"Retry-After": "5"})
+codex_review_log.txt:392: 357:     uvicorn.run(app, host="0.0.0.0", port=8000, workers=1, access_log=False)
+codex_review_log.txt:395:   3: # https://hub.docker.com/v2/repositories/runners/runpod-worker-cuda/tags?page_size=100
+codex_review_log.txt:398:   6: FROM runners/runpod-worker-cuda:${RUNPOD_CUDA_TAG}
+codex_review_log.txt:402:  10: # https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz
+codex_review_log.txt:403:  11: # https://github.com/ggml-org/llama.cpp/releases/download/b12359/cudart-llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz
+codex_review_log.txt:420:  28: # Archive contents were NOT downloaded/inspected locally: LLAMA_BIN_DIR is a search
+codex_review_log.txt:429:  37:         "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/${LLAMA_ARCHIVE}" -o /tmp/llama.tar.gz; \
+codex_review_log.txt:431:  39:         "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/${CUDART_ARCHIVE}" -o /tmp/cudart.tar.gz; \
+codex_review_log.txt:440:  48: # Its launch/import contract remains unverified because its repository is unavailable.
+codex_review_log.txt:443:  51: EXPOSE 8000
+codex_review_log.txt:471:?? "../SPECTRA_\346\210\220\346\234\254\347\233\210\345\210\251\346\250\241\345\236\213_v1.1_20261115.html"
+codex_review_log.txt:472:?? "../SPECTRA_\346\210\220\346\234\254\347\233\210\345\210\251\346\250\241\345\236\213_v1_20261115.html"
+codex_review_log.txt:509:web search: https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/common/arg.cpp
+codex_review_log.txt:510:web search: site:github.com/runpod "runners/runpod_worker" ...
+codex_review_log.txt:512:web search: site:github.com/runpod "runners/runpod_worker" ...
+codex_review_log.txt:517:  28: # Archive contents were NOT downloaded/inspected locally: LLAMA_BIN_DIR is a search
+codex_review_log.txt:526:  37:         "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/${LLAMA_ARCHIVE}" -o /tmp/llama.tar.gz; \
+codex_review_log.txt:528:  39:         "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/${CUDART_ARCHIVE}" -o /tmp/cudart.tar.gz; \
+codex_review_log.txt:537:  48: # Its launch/import contract remains unverified because its repository is unavailable.
+codex_review_log.txt:540:  51: EXPOSE 8000
+codex_review_log.txt:571:"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "rg -n -i 'github|runpod.worker|contract|booting|health|spec|kv|parallel|8000' README.md codex_review_log.txt hermes_setup.txt; curl.exe -L -sS -w '\\nHTTP %{http_code}\\n' --max-time 25 https://api.github.com/repos/runners/runpod_worker" in F:\TG Bot Bulid\team_llm
+README.md:7:- 指定的 [Docker Hub tags API](https://hub.docker.com/v2/repositories/runners/runpod-worker-cuda/tags?page_size=100) 实测 HTTP 404，不能确认该镜像的公开可用性、官方归属或最新 cu12.x tag。因此 Dockerfile 的 `RUNPOD_CUDA_TAG` 是必填 build arg，没有虚构默认 tag。需要取得真实 tag，并验证镜像内 `/handler/main.py` 会启动/导入 `/server.py`，将请求交给端口 8000；当前不能声称镜像可直接构建部署。
+README.md:8:- [llama.cpp latest API](https://api.github.com/repos/ggml-org/llama.cpp/releases/latest) 返回 `v1.0.0`，仅含 `nightly-tag.txt`，没有 `linux-amd64-Cuda.tar.gz`。Dockerfile 固定到该正式版明确链接的 [b12359](https://github.com/ggml-org/llama.cpp/releases/tag/b12359)，下载真实的 `llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz` 及配套 `cudart-...`，按 API SHA256 校验。它是 latest 正式版关联的构建，不是最新 nightly；本次也观察到更新的 nightly 发布。
+README.md:35:主机 RAM 与 VRAM 分别预算：93.363 GiB 权重之外还要容纳视觉塔、KV、计算缓冲、MTP 状态。默认 `-ngl 99`、262K context、q8 KV 在 96 GB 显卡上**尚未验证能同时容纳**，主机 RAM 充足不能解决全 GPU offload 的 OOM。若 OOM，先降低 `N_GPU_LAYERS` 或 `CTX_SIZE`，或切 IQ3_M；不要把 mmap 等同于自动 CPU offload。
+README.md:39:默认命令包含：`--host 127.0.0.1 --port 8080 -ngl 99 --flash-attn on -c 262144 --parallel 4 --cache-type-k q8_0 --cache-type-v q8_0 --jinja --timeout 1200 --alias team-hermes`，并携带默认模型和视觉塔路径。`--jinja` 用于 Hermes 工具调用。
+README.md:47:| `CTX_SIZE` / `PARALLEL` | `262144` / `4` |
+README.md:49:| `SPEC_MTP` / `SPEC_DRAFT_MAX` | `0` / `4`；仅 `SPEC_MTP=1` 启用 MTP |
+README.md:58:启用 `SPEC_MTP=1` 时追加 `--spec-type draft-mtp --spec-draft-max 4`。若子进程在首次就绪前失败，监控线程立即去掉这两组参数重试一次；本 worker 生命周期后续按不带 MTP 的配置退避重启。已就绪后的崩溃先保留 MTP 重启，若再次启动失败才触发这一次回退。参数兼容回退不能修复模型架构不受支持或 OOM。
+README.md:60:切换小模型：设置 `MODEL_FILE=/data/models/Qwen3.8-Flash-Next-Uncensored-IQ3_M-00001-of-00002.gguf`，同时设 `SPEC_MTP=0`，重新启动 worker；`MODEL_ALIAS=team-hermes` 保持团队配置稳定。
+README.md:64:- `GET /`：200；`GET /health`：已就绪为 200 `{"message":"ready"}`，未就绪仍为 200 `{"message":"booting"}`。这是指定模板契约，HTTP 200 本身不能当作模型已加载；推理未就绪时返回 503，需重试。
+README.md:91:`/stream/{job_id}` 的队列结果格式不同于 OpenAI SSE，不能直接作为 Hermes `base_url`；`POST /run/{id}` 不是标准提交路径。也可按 [Load balancing 官方指南](https://github.com/runpod/runpod-plugins-official/blob/main/plugins/runpod/skills/runpod/golden-paths/14-load-balancing-endpoint.md) 暴露本 HTTP 服务，使用 `https://{endpoint_id}.api.runpod.ai/v1` 作为 base_url，但须另行核实模板是否适用。
+{
+  "message": "Not Found",
+  "documentation_url": "https://docs.github.com/rest/repos/repos#get-a-repository",
+  "status": "404"
+}
+
+HTTP 404
+
+web search: https://github.com/runners/runpod_worker
+web search: '--spec-draft-n-max' in https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/common/arg.cpp
+codex
+已确认 b12359 不接受 `--spec-draft-max`，正确参数是 `--spec-draft-n-max`；当前回退逻辑会在启用 MTP 失败后改为普通推理。另一个需要区分的点是：显式设置 `--parallel 4` 时，不能直接套用自动 slot 模式的共享 KV 默认值。我会继续核对源码和流式断连清理路径。
+web search: 
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "@'
+import urllib.request, concurrent.futures
+checks = {
+ 'arg':'https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/common/arg.cpp',
+ 'params':'https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/common/common.h',
+ 'context':'https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/tools/server/server-context.cpp',
+ 'spec':'https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/common/speculative.cpp',
+ 'multimodal':'https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/docs/multimodal.md',
+}
+terms = {
+ 'arg':['kv_unified', 'n_parallel', 'spec-draft-max', 'spec-draft-n-max', 'draft-n', '\"-n\"', 'spec-type'],
+ 'params':['kv_unified', 'n_parallel', 'kv_unified_per_slot'],
+ 'context':['kv_unified', 'n_ctx_slot', 'n_ctx_per_seq', 'n_parallel'],
+ 'spec':['\"draft-mtp\"'],
+ 'multimodal':['KV', 'parallel', 'context', 'mtp'],
+}
+def go(item):
+ name,url=item
+ try:
+  raw=urllib.request.urlopen(url,timeout=25).read().decode()
+  rows=raw.splitlines()
+  hits=[i for i,s in enumerate(rows) if any(t in s for t in terms[name])]
+  indexes=sorted({j for i in hits for j in range(max(0,i-2),min(len(rows),i+4))})
+  return '\\n'.join([name+' '+url]+[f'{j+1}: {rows[j]}' for j in indexes])
+ except Exception as e:return name+' '+str(e)
+with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+ for result in ex.map(go,checks.items()): print(result)
+'@ | python -B -" in F:\TG Bot Bulid\team_llm
+ succeeded in 2455ms:
+arg https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/common/arg.cpp
+570: 
+571:     // infer the speculative type from the draft GGUF metadata when none is requested
+572:     // note: reads only the first split - sharded drafts need an explicit --spec-type
+573:     if (spec_types_is_default(params) && !params.speculative.draft.mparams.path.empty()) {
+574:         const auto types_gguf = common_speculative_types_from_gguf(params.speculative.draft.mparams.path);
+575:         if (!types_gguf.empty()) {
+836:             }
+837:             if (!seen_args.insert(arg).second) {
+838:                 const bool skip = (arg == "--spec-type");
+839: 
+840:                 if (!skip) {
+841:                     LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
+1229:         }
+1230:         if (!seen_args.insert(arg).second) {
+1231:             const bool skip = (arg == "--spec-type");
+1232: 
+1233:             if (!skip) {
+1234:                 LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
+1372:         params.sampling.temp = 0.2; // lower temp by default for better quality
+1373:     } else if (ex == LLAMA_EXAMPLE_SERVER) {
+1374:         params.n_parallel = -1;     // auto by default
+1375:     } else if (ex == LLAMA_EXAMPLE_TOKENIZE) {
+1376:         params.parse_special = true; // parse special tokens by default, like the old tokenize tool
+1377:     } else if (ex == LLAMA_EXAMPLE_TTS) {
+1621:         { "--kv-unified-per-slot" }, "N",
+1622:         "context limit per parallel slot (default: unset, behavior unchanged).\n"
+1623:         "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",
+1624:         [](common_params & params, int value) {
+1625:             params.kv_unified_per_slot = value;
+1626:         }
+1627:     ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+1628:     add_opt(common_arg(
+1629:         {"-n", "--predict", "--n-predict"}, "N",
+1630:         string_format(
+1631:             ex == LLAMA_EXAMPLE_COMPLETION
+1632:                 ? "number of tokens to predict (default: %d, -1 = infinity, -2 = until context filled)"
+1698:         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
+1699:         [](common_params & params, bool value) {
+1700:             params.kv_unified = value;
+1701:         }
+1702:     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
+1703:     add_opt(common_arg(
+2506:         add_opt(common_arg(
+2507:             {"-np", "--parallel"}, "N",
+2508:             string_format("number of server slots (default: %d, -1 = auto)", params.n_parallel),
+2509:             [](common_params & params, int value) {
+2510:                 if (value == 0) {
+2511:                     throw std::invalid_argument("error: invalid value for n_parallel\n");
+2512:                 }
+2513:                 params.n_parallel = value;
+2514:             }
+2515:         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+2516:     } else {
+2517:         add_opt(common_arg(
+2518:             {"-np", "--parallel"}, "N",
+2519:             string_format("number of parallel sequences to decode (default: %d)", params.n_parallel),
+2520:             [](common_params & params, int value) {
+2521:                 params.n_parallel = value;
+2522:             }
+2523:         ).set_env("LLAMA_ARG_N_PARALLEL"));
+2524:     }
+4170:     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
+4171:     add_opt(common_arg(
+4172:         {"--spec-draft-n-cpu-moe", "--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"}, "N",
+4173:         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model",
+4174:         [](common_params & params, int value) {
+4175:             if (value < 0) {
+4181: 
+4182:     add_opt(common_arg(
+4183:         {"--spec-draft-n-max"}, "N",
+4184:         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+4185:         [](common_params & params, int value) {
+4186:             if (value < 0) {
+4191:     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+4192:     add_opt(common_arg(
+4193:         {"--spec-draft-n-min"}, "N",
+4194:         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
+4195:         [](common_params & params, int value) {
+4196:             params.speculative.draft.n_min = value;
+4198:     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+4199:     add_opt(common_arg(
+4200:         {"--spec-draft-n-ubatch"}, "N",
+4201:         string_format("physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: %d - same as --n-ubatch)", params.speculative.draft.n_ubatch),
+4202:         [](common_params & params, int value) {
+4203:             if (value < 0) {
+4288:     GGML_ASSERT(params.speculative.draft.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
+4289:     add_opt(common_arg(
+4290:         {"--spec-draft-ngl", "-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"}, "N",
+4291:         string_format("max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: %s)",
+4292:             params.speculative.draft.n_gpu_layers == -1 ? "auto" : "all"),
+4293:         [](common_params & params, const std::string & value) {
+4315:     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_IMATRIX}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
+4316:     add_opt(common_arg(
+4317:         {"--spec-type"}, common_speculative_all_types_str(),
+4318:         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
+4319:             common_speculative_type_name_str(params.speculative.types).c_str()),
+4320:         [](common_params & params, const std::string & value) {
+4453: 
+4454:     add_opt(common_arg(
+4455:         {"--draft", "--draft-n", "--draft-max"}, "N",
+4456:         "the argument has been removed. use --spec-draft-n-max or --spec-ngram-mod-n-max",
+4457:         [](common_params & /*params*/, int /*value*/) {
+4458:             arg_removed("use --spec-draft-n-max or --spec-ngram-mod-n-max");
+4459:         }
+4460:     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
+4461:     add_opt(common_arg(
+4462:         {"--draft-min", "--draft-n-min"}, "N",
+4463:         "the argument has been removed. use --spec-draft-n-min or --spec-ngram-mod-n-min",
+4464:         [](common_params & /*params*/, int /*value*/) {
+4465:             arg_removed("use --spec-draft-n-min or --spec-ngram-mod-n-min");
+4466:         }
+4467:     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MIN"));
+4468:     add_opt(common_arg(
+4642:             params.n_ubatch = 2048;
+4643:             params.n_batch = 2048;
+4644:             params.n_parallel = 32;
+4645:             params.n_ctx = 2048*params.n_parallel;
+4646:             params.verbose_prompt = true;
+4647:             params.embedding = true;
+4648:         }
+4746:             params.n_ubatch = 2048;
+4747:             params.n_batch = 32768;
+4748:             params.n_parallel = 2;
+4749:             params.n_ctx = 131072*params.n_parallel;
+4750:             params.sampling.temp = 1.0f;
+4751:             params.sampling.top_p = 1.0f;
+4752:             params.sampling.top_k = 0;
+4764:             params.n_ubatch = 2048;
+4765:             params.n_batch = 32768;
+4766:             params.n_parallel = 2;
+4767:             params.n_ctx = 131072*params.n_parallel;
+4768:             params.sampling.temp = 1.0f;
+4769:             params.sampling.top_p = 1.0f;
+4770:             params.sampling.top_k = 0;
+params https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/common/common.h
+474:     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
+475:     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
+476:     int32_t n_parallel            =     1; // number of parallel sequences to decode
+477:     int32_t n_sequences           =     1; // number of sequences to decode
+478:     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
+479:     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
+592:     bool ctx_shift         = false; // context shift on infinite text generation
+593:     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+594:     bool kv_unified        = false; // enable unified KV cache
+595: 
+596:     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
+597:     bool verbose_prompt    = false; // print prompt tokens before generation
+653:     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
+654:     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+655:     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
+656:     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+657:     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+658:     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+context https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/tools/server/server-context.cpp
+61: 
+62:     auto result = common_speculative_get_output_limits(
+63:             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+64: 
+65:     result.total   = std::max<int32_t>(1, result.total);
+66:     result.per_seq = std::max<int32_t>(1, result.per_seq);
+1445: 
+1446:         {
+1447:             // note: the capping itself is done in n_ctx_slot(), here we only report it
+1448:             const int n_ctx_seq = llama_n_ctx_seq(ctx_tgt);
+1449: 
+1450:             if (params_base.kv_unified_per_slot > 0) {
+1451:                 if (n_ctx_seq > params_base.kv_unified_per_slot) {
+1452:                     SRV_INF("capping per-slot context (%d) to --kv-unified-per-slot (%d)\n",
+1453:                             n_ctx_seq, params_base.kv_unified_per_slot);
+1454:                 } else if (params_base.kv_unified_per_slot > n_ctx_seq) {
+1455:                     // cap is above the per-slot pool capacity, so it can never bind
+1456:                     SRV_WRN(
+1457:                         "--kv-unified-per-slot (%d) exceeds the per-slot pool capacity (%d) - cap has no effect, "
+1458:                         "slots are limited to %d (raise the KV pool with -c, or unset -c to size it to "
+1459:                         "n_parallel * kv_unified_per_slot)\n",
+1460:                         params_base.kv_unified_per_slot, n_ctx_seq, n_ctx_seq);
+1461:                 }
+1462:             }
+1463: 
+1464:             const int n_ctx_capped = params_base.kv_unified_per_slot > 0 ?
+1465:                 std::min(n_ctx_seq, params_base.kv_unified_per_slot) : n_ctx_seq;
+1466: 
+1467:             if (n_ctx_capped > n_ctx_train) {
+1468:                 SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n",
+1483: 
+1484:         // setup slots
+1485:         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
+1486:                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+1487: 
+1488:         // initialize slots
+1489:         for (int i = 0; i < params_base.n_parallel; i++) {
+1490:             slots.emplace_back();
+1491:         }
+1492: 
+1494:         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+1495:             try {
+1496:                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+1497:             } catch (const std::exception & e) {
+1498:                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+1499:                 if (params_base.speculative.has_synth()) {
+1520:         }
+1521: 
+1522:         for (int i = 0; i < params_base.n_parallel; i++) {
+1523:             server_slot & slot = slots[i];
+1524: 
+1525:             slot.id      = i;
+1528:             slot.mem.init(ctx_tgt, ctx_dft);
+1529:             slot.spec    = spec.get();
+1530:             slot.n_ctx   = n_ctx_slot();
+1531: 
+1532:             slot.mctx                   = mctx;
+1533:             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+1580:         }
+1581: 
+1582:         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
+1583:         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
+1584:         {
+1585:             const int32_t n_batch = llama_n_batch(ctx_tgt);
+1586:             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
+1587:             batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
+1588:         }
+1589: 
+1590:         // decision requests rarely repeat a state, the prompt cache is opt-in for decision models
+1669:                 params_base.cache_idle_slots = false;
+1670:             } else {
+1671:                 if (params_base.kv_unified) {
+1672:                     SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
+1673:                 } else {
+1674:                     // without a unified KV cache, clearing a slot frees no reusable room, so we only
+1916:         bool res = false;
+1917: 
+1918:         if (!params_base.kv_unified) {
+1919:             return res;
+1920:         }
+1921: 
+3091:                                 }
+3092: 
+3093:                                 if (params_base.kv_unified) {
+3094:                                     // [TAG_IDLE_SLOT_CLEAR]
+3095:                                     slot.prompt_clear();
+3096:                                 }
+4037:                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+4038: 
+4039:                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
+4040:                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
+4041: 
+4042:                         // print prompt tokens (for debugging)
+5088: 
+5089:     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
+5090:     int n_ctx_slot() const {
+5091:         int res = llama_n_ctx_seq(ctx_tgt);
+5092: 
+5093:         if (params_base.kv_unified_per_slot > 0) {
+5094:             res = std::min(res, params_base.kv_unified_per_slot);
+5095:         }
+5096: 
+5097:         return std::min(res, llama_model_n_ctx_train(model_tgt));
+5273:         /* tts_voices              */ std::move(tts_voices),
+5274:         /* json_ui_settings        */ impl->json_ui_settings,
+5275:         /* slot_n_ctx              */ impl->n_ctx_slot(),
+5276:         /* pooling_type            */ llama_pooling_type(impl->ctx_tgt),
+5277: 
+5278:         /* chat_params             */ impl->chat_params,
+5710:     json props = {
+5711:         { "default_generation_settings", default_generation_settings_for_props },
+5712:         { "total_slots",                 params.n_parallel },
+5713:         { "model_alias",                 meta.model_name },
+5714:         { "model_ftype",                 meta.model_ftype },
+5715:         { "model_path",                  meta.model_path },
+6580:             }
+6581:             if (decision.can_share_prompt()) {
+6582:                 tasks = server_decision_group_tasks(std::move(tasks), params.n_parallel);
+6583:             }
+6584:             rd.post_tasks(std::move(tasks));
+6585:         }
+spec https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/common/speculative.cpp
+74:     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
+75:     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
+76:     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+77:     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
+78:     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
+79:     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
+2539:         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
+2540:         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
+2541:         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+2542:         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
+2543:         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
+2544:         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
+multimodal https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/docs/multimodal.md
+48: Replaces the `(tool_name)` with the name of binary you want to use. For example, `llama-mtmd-cli` or `llama-server`
+49: 
+50: NOTE: some models may require large context window, for example: `-c 8192`
+51: 
+52: **Vision models**:
+53: 
+
+web search: "runners/runpod_worker" ...
+web search: 
+web search: "runpod_worker" "handle_request" ...
+web search: 
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "@'
+import concurrent.futures, urllib.request, urllib.error, json
+urls=[
+ 'https://docs.runpod.io/llms.txt',
+ 'https://api.github.com/repos/runpod/docs/contents',
+ 'https://api.github.com/search/repositories?q=runpod_worker+in:name&per_page=15',
+ 'https://api.github.com/repos/runpod/runpod-worker-template',
+ 'https://hub.docker.com/v2/repositories/runners/runpod-worker-cuda/',
+ 'https://raw.githubusercontent.com/runners/runpod_worker/main/README.md',
+ 'https://raw.githubusercontent.com/runners/runpod_worker/master/README.md',
+ 'https://raw.githubusercontent.com/encode/starlette/0.41.3/starlette/responses.py',
+ 'https://raw.githubusercontent.com/encode/httpx/0.28.1/httpx/_client.py'
+]
+def go(url):
+ try:
+  response=urllib.request.urlopen(url,timeout=25); data=response.read().decode(); code=response.status
+  if 'llms.txt' in url:
+   data='\\n'.join(s for s in data.splitlines() if any(t in s.lower() for t in ['load balanc','worker','health','handler']))
+  elif 'search/repositories' in url:
+   obj=json.loads(data); data=json.dumps({'total_count':obj['total_count'],'items':[{'full_name':p['full_name'],'url':p['html_url']} for p in obj['items']]})
+  elif '/contents' in url: data=json.dumps([{'name':p['name'],'type':p['type']} for p in json.loads(data)])
+  elif 'responses.py' in url:
+   rows=data.splitlines(); i=next(i for i,s in enumerate(rows) if 'class StreamingResponse' in s); data='\\n'.join(f'{j+1}: {rows[j]}' for j in range(i,min(len(rows),i+100)))
+  elif '_client.py' in url:
+   rows=data.splitlines(); hits=[i for i,s in enumerate(rows) if 'async def send' in s]; i=hits[0]; data='\\n'.join(f'{j+1}: {rows[j]}' for j in range(i,i+55))
+  elif len(data)>4000:data=data[:4000]
+  return f'{url}\\nHTTP {code}\\n{data}'
+ except urllib.error.HTTPError as e:return f'{url}\\nHTTP {e.code}'
+ except Exception as e:return f'{url}\\n{type(e).__name__}: {e}'
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+ for s in ex.map(go,urls):print(s+'\\n')
+'@ | python -B -" in F:\TG Bot Bulid\team_llm
+web search: https://www.python-httpx.org/async/
+ succeeded in 4668ms:
+https://docs.runpod.io/llms.txt
+HTTP 200
+- [Runpod Python SDK](https://docs.runpod.io/sdk/overview.md): Use the runpod Python package to define GPU functions, deploy apps, call endpoints, build Serverless workers, and manage Runpod resources from one SDK.
+- [CPU types](https://docs.runpod.io/sdk/configuration/cpu-types.md): Run Runpod SDK resources on CPU-only workers. Compare CPU instance types by vCPU and memory, and see which data centers stock each generation.
+- [Storage](https://docs.runpod.io/sdk/configuration/storage.md): Attach network volumes and global volumes to Runpod SDK resources with mounts, read volume paths in worker code, and avoid common storage mistakes.
+- [Configuration best practices](https://docs.runpod.io/sdk/configuration/best-practices.md): Recommended Runpod SDK resource settings for production, development, and cost control, including worker counts, idle timeouts, and GPU selection.
+- [Dev sessions](https://docs.runpod.io/sdk/apps/dev-sessions.md): Use rp flash dev to run a Runpod SDK app against temporary endpoints, stream worker logs, re-run on code changes, and clean up when you finish.
+- [Quickstart](https://docs.runpod.io/serverless/quickstart.md): Write a handler function, build a worker image, create an endpoint, and send your first request. See Runpod Serverless setup and usage details.
+- [Overview](https://docs.runpod.io/serverless/workers/handler-functions.md): Write custom handler functions to process incoming requests to your queue-based endpoints. See Runpod Serverless setup and usage details.
+- [Local testing](https://docs.runpod.io/serverless/development/local-testing.md): Test your Serverless handlers locally before deploying to production. Review configuration and operations guidance for Runpod Serverless.
+- [Validate inputs](https://docs.runpod.io/serverless/development/validation.md): Validate handler inputs using the Runpod SDK schema validator. Review setup, configuration, deployment, and operations guidance for Runpod Serverless.
+- [Write logs](https://docs.runpod.io/serverless/development/write-logs.md): Write application logs from your handler functions to the console or persistent storage. See Runpod Serverless setup and usage details.
+- [Use Hugging Face models](https://docs.runpod.io/serverless/development/huggingface-models.md): Integrate pre-trained Hugging Face models into your Serverless handler functions. Review configuration and operations guidance for Runpod Serverless.
+- [Aggregate streaming outputs](https://docs.runpod.io/serverless/development/aggregate-outputs.md): Automatically collect and aggregate yielded results from streaming handler functions. See Runpod Serverless setup and usage details.
+- [Fitness checks and preflight checks](https://docs.runpod.io/serverless/development/fitness-checks.md): Validate Serverless worker dependencies at startup with custom and automatic fitness checks, failure handling, configuration, and operations guidance.
+- [Build a concurrent handler](https://docs.runpod.io/serverless/workers/concurrent-handler.md): Build a concurrent handler function to process multiple requests simultaneously on a single worker. See Runpod Serverless setup and usage details.
+- [Overview](https://docs.runpod.io/serverless/workers/overview.md): Package your handler function for deployment. Review setup, configuration, deployment, and operations guidance for Runpod Serverless.
+- [Create a Dockerfile](https://docs.runpod.io/serverless/workers/create-dockerfile.md): Package your handler function for deployment. Review setup, configuration, deployment, and operations guidance for Runpod Serverless.
+- [Deploy workers from Docker Hub](https://docs.runpod.io/serverless/workers/deploy.md): Build, test, and deploy your worker image from Docker Hub. Review setup, configuration, deployment, and operations guidance for Runpod Serverless.
+- [Deploy workers from GitHub](https://docs.runpod.io/serverless/workers/github-integration.md): Speed up development by deploying workers directly from GitHub. Review configuration and operations guidance for Runpod Serverless.
+- [Storage options](https://docs.runpod.io/serverless/storage/overview.md): Storage options for Serverless workers: container disks, network volumes, and S3-compatible storage.
+- [Cache files to a network volume](https://docs.runpod.io/serverless/development/volume-cache.md): Persist model weights and other files to an attached network volume to speed up Serverless worker cold starts.
+- [Pod-first development](https://docs.runpod.io/serverless/development/dual-mode-worker.md): Develop on a Pod before deploying your worker to Serverless for faster iteration. Review configuration and operations guidance for Runpod Serverless.
+- [Rolling releases](https://docs.runpod.io/serverless/endpoints/rolling-releases.md): Understand how Runpod rolls out Serverless endpoint updates without downtime, including worker replacement, version tracking, and rollback behavior.
+- [Cached models](https://docs.runpod.io/serverless/endpoints/model-caching.md): Accelerate worker cold starts and reduce costs by using cached models. Review configuration and operations guidance for Runpod Serverless.
+- [Monitor logs](https://docs.runpod.io/serverless/development/logs.md): View and access logs for Serverless endpoints and workers. Review setup, configuration, deployment, and operations guidance for Runpod Serverless.
+- [Benchmark workers and requests](https://docs.runpod.io/serverless/development/benchmarking.md): Measure the performance of your Serverless workers and identify bottlenecks. Review configuration and operations guidance for Runpod Serverless.
+- [Connect to workers with SSH](https://docs.runpod.io/serverless/development/ssh-into-workers.md): SSH into running workers for debugging and troubleshooting. Review setup, configuration, deployment, and operations guidance for Runpod Serverless.
+- [Overview](https://docs.runpod.io/serverless/load-balancing/overview.md): Deploy custom direct-access REST APIs with load balancing Serverless endpoints. Review configuration and operations guidance for Runpod Serverless.
+- [Build a load balancing worker](https://docs.runpod.io/serverless/load-balancing/build-a-worker.md): Learn how to implement and deploy a load balancing worker with FastAPI. Review configuration and operations guidance for Runpod Serverless.
+- [Build a load balancing vLLM endpoint](https://docs.runpod.io/serverless/load-balancing/vllm-worker.md): Learn how to deploy a custom vLLM server to a load balancing Serverless endpoint. Review configuration and operations guidance for Runpod Serverless.
+- [Worker affinity](https://docs.runpod.io/serverless/load-balancing/worker-affinity.md): Pin follow-up requests to a specific worker using the X-Runpod-Worker-Id header. Review configuration and operations guidance for Runpod Serverless.
+- [Overview](https://docs.runpod.io/serverless/vllm/overview.md): Deploy scalable LLM inference endpoints using vLLM workers. Review setup, configuration, deployment, and operations guidance for Runpod Serverless.
+- [Send requests to vLLM workers](https://docs.runpod.io/serverless/vllm/vllm-requests.md): Use Runpod's native API to send requests to vLLM workers. Review setup, configuration, deployment, and operations guidance for Runpod Serverless.
+- [OpenAI API compatibility](https://docs.runpod.io/serverless/vllm/openai-compatibility.md): Use OpenAI client libraries with your vLLM workers. Review setup, configuration, deployment, and operations guidance for Runpod Serverless.
+- [vLLM environment variables](https://docs.runpod.io/serverless/vllm/environment-variables.md): Configure your vLLM workers using environment variables. Review setup, configuration, deployment, and operations guidance for Runpod Serverless.
+- [Troubleshooting](https://docs.runpod.io/serverless/troubleshooting.md): Common issues and solutions for Serverless endpoints and workers. Review configuration and operations guidance for Runpod Serverless.
+- [Overview](https://docs.runpod.io/storage/globalvolume/overview.md): Create a Runpod global volume, attach it to Pods or Serverless workers across data centers, and review storage costs and limitations.
+- [Global volumes for Serverless](https://docs.runpod.io/storage/globalvolume/globalvolume-serverless.md): Attach a global volume to a GPU Serverless endpoint so workers share access to model weights and other read-heavy data across all data centers.
+- [Update a secret](https://docs.runpod.io/api-reference-v2/account/update-a-secret.md): Update a Runpod account secret's description or rotate its value. The new value takes effect the next time a referencing Pod or worker boots.
+- [List serverless endpoints](https://docs.runpod.io/api-reference-v2/serverless/list-serverless-endpoints.md): List all Runpod Serverless endpoints owned by the authenticated user, including compute, worker, scaling, and deployment settings.
+- [Create a serverless endpoint](https://docs.runpod.io/api-reference-v2/serverless/create-a-serverless-endpoint.md): Create a Runpod Serverless endpoint with GPU or CPU compute, container or template settings, worker limits, and scaling policies.
+- [Get a serverless endpoint](https://docs.runpod.io/api-reference-v2/serverless/get-a-serverless-endpoint.md): Retrieve a Runpod Serverless endpoint by ID with its compute, worker, scaling, container, storage, and current status settings.
+- [Delete a serverless endpoint](https://docs.runpod.io/api-reference-v2/serverless/delete-a-serverless-endpoint.md): Permanently delete a Runpod Serverless endpoint, terminate its workers, cancel queued and active jobs, and remove its bound template.
+- [Update a serverless endpoint](https://docs.runpod.io/api-reference-v2/serverless/update-a-serverless-endpoint.md): Update selected settings on a Runpod Serverless endpoint, including compute, workers, scaling, storage, and container configuration.
+- [List serverless endpoint workers](https://docs.runpod.io/api-reference-v2/serverless/list-serverless-endpoint-workers.md): List active workers for a Runpod Serverless endpoint with worker status, runtime details, and summary counts grouped by status.
+- [List serverless endpoint releases](https://docs.runpod.io/api-reference-v2/serverless/list-serverless-endpoint-releases.md): List a Serverless endpoint's release history, configuration changes, build IDs, and current worker rollout status, newest release first.
+- [Get serverless endpoint worker metrics](https://docs.runpod.io/api-reference-v2/serverless/get-serverless-endpoint-worker-metrics.md): Get worker counts by state for a Runpod Serverless endpoint as a time series.
+- [Stream serverless worker logs](https://docs.runpod.io/api-reference-v2/serverless/stream-serverless-worker-logs.md): Stream a Runpod Serverless worker's logs in real time as Server-Sent Events, with resumable reconnects via Last-Event-ID.
+- [Create a network volume](https://docs.runpod.io/api-reference-v2/network-volumes/create-a-network-volume.md): Create a persistent Runpod network volume with a name, size, data center, and storage tier for use by Pods and Serverless workers.
+- [Create a global volume](https://docs.runpod.io/api-reference-v2/global-volumes/create-a-global-volume.md): Create a named Runpod global volume through the REST API for storage that Pods and Serverless workers can access across data centers.
+- [Integrate Runpod with n8n](https://docs.runpod.io/integrations/n8n-integration.md): Deploy a vLLM worker on Runpod and connect it to n8n to build AI-powered workflows with authenticated inference requests and reusable automations.
+- [Run Ollama on Serverless (CPU)](https://docs.runpod.io/tutorials/serverless/run-ollama-inference.md): Learn how to run an Ollama server on Serverless CPU workers. Follow implementation steps, configuration guidance, and examples in this Runpod tutorial.
+
+https://api.github.com/repos/runpod/docs/contents
+HTTP 200
+[{"name": ".claude", "type": "dir"}, {"name": ".cursor", "type": "dir"}, {"name": ".github", "type": "dir"}, {"name": ".gitignore", "type": "file"}, {"name": ".mintignore", "type": "file"}, {"name": ".vale.ini", "type": "file"}, {"name": ".yarnclean", "type": "file"}, {"name": "CLAUDE.md", "type": "file"}, {"name": "README.md", "type": "file"}, {"name": "accounts-billing", "type": "dir"}, {"name": "agent-setup.mdx", "type": "file"}, {"name": "api-reference-v2", "type": "dir"}, {"name": "api-reference", "type": "dir"}, {"name": "chat-widget.js", "type": "file"}, {"name": "community-solutions", "type": "dir"}, {"name": "containers.mdx", "type": "file"}, {"name": "docs.json", "type": "file"}, {"name": "e2fc24a892c8217d2a2629a747520aa8.txt", "type": "file"}, {"name": "fine-tune.mdx", "type": "file"}, {"name": "flash", "type": "dir"}, {"name": "get-started.mdx", "type": "file"}, {"name": "get-started", "type": "dir"}, {"name": "helpers", "type": "dir"}, {"name": "hub", "type": "dir"}, {"name": "images", "type": "dir"}, {"name": "instant-clusters.mdx", "type": "file"}, {"name": "instant-clusters", "type": "dir"}, {"name": "integrations", "type": "dir"}, {"name": "logo", "type": "dir"}, {"name": "migrate", "type": "dir"}, {"name": "og-icon-trim.svg", "type": "file"}, {"name": "og-logo-dark.svg", "type": "file"}, {"name": "og-logo-light.svg", "type": "file"}, {"name": "organizations", "type": "dir"}, {"name": "overview.mdx", "type": "file"}, {"name": "package-lock.json", "type": "file"}, {"name": "pods", "type": "dir"}, {"name": "posthog.js", "type": "file"}, {"name": "public-endpoints", "type": "dir"}, {"name": "references", "type": "dir"}, {"name": "release-notes.mdx", "type": "file"}, {"name": "robots.txt", "type": "file"}, {"name": "runpodctl", "type": "dir"}, {"name": "scripts", "type": "dir"}, {"name": "sdk", "type": "dir"}, {"name": "sdks", "type": "dir"}, {"name": "serverless", "type": "dir"}, {"name": "snippets", "type": "dir"}, {"name": "storage", "type": "dir"}, {"name": "style.css", "type": "file"}, {"name": "styles", "type": "dir"}, {"name": "tests", "type": "dir"}, {"name": "tips-and-tricks", "type": "dir"}, {"name": "tutorials", "type": "dir"}]
+
+https://api.github.com/search/repositories?q=runpod_worker+in:name&per_page=15
+HTTP 200
+{"total_count": 530, "items": [{"full_name": "runpod-workers/worker-comfyui", "url": "https://github.com/runpod-workers/worker-comfyui"}, {"full_name": "runpod-workers/worker-vllm", "url": "https://github.com/runpod-workers/worker-vllm"}, {"full_name": "SvenBrnn/runpod-worker-ollama", "url": "https://github.com/SvenBrnn/runpod-worker-ollama"}, {"full_name": "runpod-workers/worker-a1111", "url": "https://github.com/runpod-workers/worker-a1111"}, {"full_name": "runpod-workers/worker-template", "url": "https://github.com/runpod-workers/worker-template"}, {"full_name": "runpod-workers/worker-faster_whisper", "url": "https://github.com/runpod-workers/worker-faster_whisper"}, {"full_name": "ashleykleynhans/runpod-worker-inswapper", "url": "https://github.com/ashleykleynhans/runpod-worker-inswapper"}, {"full_name": "runpod-workers/worker-sdxl", "url": "https://github.com/runpod-workers/worker-sdxl"}, {"full_name": "ashleykleynhans/runpod-worker-a1111", "url": "https://github.com/ashleykleynhans/runpod-worker-a1111"}, {"full_name": "runpod-workers/worker-basic", "url": "https://github.com/runpod-workers/worker-basic"}, {"full_name": "runpod-workers/worker-sglang", "url": "https://github.com/runpod-workers/worker-sglang"}, {"full_name": "ashleykleynhans/runpod-worker-comfyui", "url": "https://github.com/ashleykleynhans/runpod-worker-comfyui"}, {"full_name": "runpod-workers/worker-infinity-embedding", "url": "https://github.com/runpod-workers/worker-infinity-embedding"}, {"full_name": "story-boards-ai/runpod-worker-a1111", "url": "https://github.com/story-boards-ai/runpod-worker-a1111"}, {"full_name": "generativelabs/runpod-worker-a1111", "url": "https://github.com/generativelabs/runpod-worker-a1111"}]}
+
+https://api.github.com/repos/runpod/runpod-worker-template
+HTTP 404
+
+https://hub.docker.com/v2/repositories/runners/runpod-worker-cuda/
+HTTP 404
+
+https://raw.githubusercontent.com/runners/runpod_worker/main/README.md
+HTTP 404
+
+https://raw.githubusercontent.com/runners/runpod_worker/master/README.md
+HTTP 404
+
+https://raw.githubusercontent.com/encode/starlette/0.41.3/starlette/responses.py
+HTTP 200
+210: class StreamingResponse(Response):
+211:     body_iterator: AsyncContentStream
+212: 
+213:     def __init__(
+214:         self,
+215:         content: ContentStream,
+216:         status_code: int = 200,
+217:         headers: typing.Mapping[str, str] | None = None,
+218:         media_type: str | None = None,
+219:         background: BackgroundTask | None = None,
+220:     ) -> None:
+221:         if isinstance(content, typing.AsyncIterable):
+222:             self.body_iterator = content
+223:         else:
+224:             self.body_iterator = iterate_in_threadpool(content)
+225:         self.status_code = status_code
+226:         self.media_type = self.media_type if media_type is None else media_type
+227:         self.background = background
+228:         self.init_headers(headers)
+229: 
+230:     async def listen_for_disconnect(self, receive: Receive) -> None:
+231:         while True:
+232:             message = await receive()
+233:             if message["type"] == "http.disconnect":
+234:                 break
+235: 
+236:     async def stream_response(self, send: Send) -> None:
+237:         await send(
+238:             {
+239:                 "type": "http.response.start",
+240:                 "status": self.status_code,
+241:                 "headers": self.raw_headers,
+242:             }
+243:         )
+244:         async for chunk in self.body_iterator:
+245:             if not isinstance(chunk, (bytes, memoryview)):
+246:                 chunk = chunk.encode(self.charset)
+247:             await send({"type": "http.response.body", "body": chunk, "more_body": True})
+248: 
+249:         await send({"type": "http.response.body", "body": b"", "more_body": False})
+250: 
+251:     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+252:         async with anyio.create_task_group() as task_group:
+253: 
+254:             async def wrap(func: typing.Callable[[], typing.Awaitable[None]]) -> None:
+255:                 await func()
+256:                 task_group.cancel_scope.cancel()
+257: 
+258:             task_group.start_soon(wrap, partial(self.stream_response, send))
+259:             await wrap(partial(self.listen_for_disconnect, receive))
+260: 
+261:         if self.background is not None:
+262:             await self.background()
+263: 
+264: 
+265: class MalformedRangeHeader(Exception):
+266:     def __init__(self, content: str = "Malformed range header.") -> None:
+267:         self.content = content
+268: 
+269: 
+270: class RangeNotSatisfiable(Exception):
+271:     def __init__(self, max_size: int) -> None:
+272:         self.max_size = max_size
+273: 
+274: 
+275: _RANGE_PATTERN = re.compile(r"(\d*)-(\d*)")
+276: 
+277: 
+278: class FileResponse(Response):
+279:     chunk_size = 64 * 1024
+280: 
+281:     def __init__(
+282:         self,
+283:         path: str | os.PathLike[str],
+284:         status_code: int = 200,
+285:         headers: typing.Mapping[str, str] | None = None,
+286:         media_type: str | None = None,
+287:         background: BackgroundTask | None = None,
+288:         filename: str | None = None,
+289:         stat_result: os.stat_result | None = None,
+290:         method: str | None = None,
+291:         content_disposition_type: str = "attachment",
+292:     ) -> None:
+293:         self.path = path
+294:         self.status_code = status_code
+295:         self.filename = filename
+296:         if method is not None:
+297:             warnings.warn(
+298:                 "The 'method' parameter is not used, and it will be removed.",
+299:                 DeprecationWarning,
+300:             )
+301:         if media_type is None:
+302:             media_type = guess_type(filename or path)[0] or "text/plain"
+303:         self.media_type = media_type
+304:         self.background = background
+305:         self.init_headers(headers)
+306:         self.headers.setdefault("accept-ranges", "bytes")
+307:         if self.filename is not None:
+308:             content_disposition_filename = quote(self.filename)
+309:             if content_disposition_filename != self.filename:
+
+https://raw.githubusercontent.com/encode/httpx/0.28.1/httpx/_client.py
+HTTP 200
+1594:     async def send(
+1595:         self,
+1596:         request: Request,
+1597:         *,
+1598:         stream: bool = False,
+1599:         auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+1600:         follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+1601:     ) -> Response:
+1602:         """
+1603:         Send a request.
+1604: 
+1605:         The request is sent as-is, unmodified.
+1606: 
+1607:         Typically you'll want to build one with `AsyncClient.build_request()`
+1608:         so that any client-level configuration is merged into the request,
+1609:         but passing an explicit `httpx.Request()` is supported as well.
+1610: 
+1611:         See also: [Request instances][0]
+1612: 
+1613:         [0]: /advanced/clients/#request-instances
+1614:         """
+1615:         if self._state == ClientState.CLOSED:
+1616:             raise RuntimeError("Cannot send a request, as the client has been closed.")
+1617: 
+1618:         self._state = ClientState.OPENED
+1619:         follow_redirects = (
+1620:             self.follow_redirects
+1621:             if isinstance(follow_redirects, UseClientDefault)
+1622:             else follow_redirects
+1623:         )
+1624: 
+1625:         self._set_timeout(request)
+1626: 
+1627:         auth = self._build_request_auth(request, auth)
+1628: 
+1629:         response = await self._send_handling_auth(
+1630:             request,
+1631:             auth=auth,
+1632:             follow_redirects=follow_redirects,
+1633:             history=[],
+1634:         )
+1635:         try:
+1636:             if not stream:
+1637:                 await response.aread()
+1638: 
+1639:             return response
+1640: 
+1641:         except BaseException as exc:
+1642:             await response.aclose()
+1643:             raise exc
+1644: 
+1645:     async def _send_handling_auth(
+1646:         self,
+1647:         request: Request,
+1648:         auth: Auth,
+
+
+web search: 
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "@'
+import concurrent.futures, urllib.request, urllib.error, json
+urls=[
+ 'https://api.github.com/repos/ggml-org/llama.cpp/git/ref/tags/b12359',
+ 'https://raw.githubusercontent.com/runpod/docs/main/serverless/load-balancing/build-a-worker.mdx',
+ 'https://raw.githubusercontent.com/runpod-workers/worker-template/main/README.md',
+ 'https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/common/common.cpp',
+ 'https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/src/llama-context.cpp',
+ 'https://api.github.com/users/runners',
+ 'https://api.github.com/repos/runpod/runpod-python/git/trees/main?recursive=1'
+]
+def go(url):
+ try:
+  data=urllib.request.urlopen(url,timeout=25).read().decode()
+  if '/common.cpp' in url or '/llama-context.cpp' in url:
+   rows=data.splitlines(); terms=['kv_unified', 'n_parallel <', 'n_ctx_seq', 'n_seq_max']; hits=[i for i,s in enumerate(rows) if any(t in s for t in terms)]; idx=sorted({j for i in hits for j in range(max(0,i-3),min(len(rows),i+5))}); data='\\n'.join(f'{i+1}: {rows[i]}' for i in idx)
+  elif '/trees/' in url:
+   data=json.dumps([p['path'] for p in json.loads(data)['tree'] if any(t in p['path'].lower() for t in ['server','health','http'])])
+  elif '/users/' in url:
+   obj=json.loads(data); data=json.dumps({k:obj.get(k) for k in ['login','html_url','name','company','bio']})
+  return url+'\\n'+data
+ except urllib.error.HTTPError as e:return url+'\\nHTTP '+str(e.code)
+with concurrent.futures.ThreadPoolExecutor(max_workers=7) as ex:
+ for s in ex.map(go,urls):print(s+'\\n')
+'@ | python -B -" in F:\TG Bot Bulid\team_llm
+ succeeded in 2657ms:
+https://api.github.com/repos/ggml-org/llama.cpp/git/ref/tags/b12359
+{"ref":"refs/tags/b12359","node_id":"REF_kwDOJH_K4LByZWZzL3RhZ3MvYjEyMzU5","url":"https://api.github.com/repos/ggml-org/llama.cpp/git/refs/tags/b12359","object":{"sha":"b1b770d90d94cad9e9ea5b993bdbc383a522fb28","type":"commit","url":"https://api.github.com/repos/ggml-org/llama.cpp/git/commits/b1b770d90d94cad9e9ea5b993bdbc383a522fb28"}}
+
+https://raw.githubusercontent.com/runpod/docs/main/serverless/load-balancing/build-a-worker.mdx
+---
+title: "Build a load balancing worker"
+sidebarTitle: "Build a load balancing worker"
+description: "Learn how to implement and deploy a load balancing worker with FastAPI. Review configuration and operations guidance for Runpod Serverless."
+---
+
+This tutorial shows how to build a load balancing worker using FastAPI and deploy it as a Serverless endpoint on Runpod.
+
+## Requirements
+
+Before you begin you'll need:
+
+- A Runpod account.
+- Basic familiarity with Python and REST APIs.
+- Docker installed on your local machine.
+
+## Step 1: Create a basic FastAPI application
+
+<Tip>
+
+You can download a preconfigured repository containing the completed code for this tutorial [on GitHub](https://github.com/runpod-workers/worker-load-balancing/).
+
+</Tip>
+
+First, let's create a simple FastAPI application that will serve as our API.
+
+Create a file named `app.py`:
+
+```python
+import os
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+# Create FastAPI app
+app = FastAPI()
+
+# Define request models
+class GenerationRequest(BaseModel):
+    prompt: str
+    max_tokens: int = 100
+    temperature: float = 0.7
+
+class GenerationResponse(BaseModel):
+    generated_text: str
+
+# Global variable to track requests
+request_count = 0
+
+# Health check endpoint; required for Runpod to monitor worker health
+@app.get("/ping")
+async def health_check():
+    return {"status": "healthy"}
+
+# Our custom generation endpoint
+@app.post("/generate", response_model=GenerationResponse)
+async def generate(request: GenerationRequest):
+    global request_count
+    request_count += 1
+
+    # A simple mock implementation; we'll replace this with an actual model later
+    generated_text = f"Response to: {request.prompt} (request #{request_count})"
+
+    return {"generated_text": generated_text}
+
+# A simple endpoint to show request stats
+@app.get("/stats")
+async def stats():
+    return {"total_requests": request_count}
+
+# Run the app when the script is executed
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", 80))
+    print(f"Starting server on port {port}")
+
+    # Start the server
+    uvicorn.run(app, host="0.0.0.0", port=port)
+```
+
+This simple application defines the following endpoints:
+
+- A health check endpoint at `/ping`
+- A text generation endpoint at `/generate`
+- A statistics endpoint at `/stats`
+
+## Step 2: Create a Dockerfile
+
+Now, let's create a `Dockerfile` to package our application:
+
+```
+FROM nvidia/cuda:12.1.0-base-ubuntu22.04 
+
+RUN apt-get update -y \
+    && apt-get install -y python3-pip
+
+RUN ldconfig /usr/local/cuda-12.1/compat/
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY app.py .
+
+# Start the handler
+CMD ["python3", "app.py"]
+```
+
+You'll also need to create a `requirements.txt` file:
+
+```
+fastapi==0.95.1
+uvicorn==0.22.0
+pydantic==1.10.7
+```
+
+## Step 3: Build and push the Docker image
+
+Build and push your Docker image to a container registry:
+
+```bash
+# Build the image
+docker build --platform linux/amd64 -t YOUR_DOCKER_USERNAME/loadbalancer-example:v1.0 . 
+
+# Push to Docker Hub
+docker push YOUR_DOCKER_USERNAME/loadbalancer-example:v1.0
+```
+
+## Step 4: Deploy to Runpod
+
+Now, let's deploy our application to a Serverless endpoint:
+
+1. Go to the [Serverless page](https://console.runpod.io/serverless) in the Runpod console.
+2. Click **New Endpoint**
+3. Click **Import from Docker Registry**.
+4. In the **Container Image** field, enter your Docker image URL: 
+    ```
+    YOUR_DOCKER_USERNAME/loadbalancer-example:v1.0
+    ```
+    Then click **Next**.
+5. Give your endpoint a name.
+6. Under **Endpoint Type**, select **Load Balancer**.
+7. Under **GPU Configuration**, select at least one GPU type (16 GB or 24 GB GPUs are fine for this example).
+8. Leave all other settings at their defaults.
+9. Click **Deploy Endpoint**.
+
+## Step 5: Access your custom API
+
+Once your endpoint is created, you can access your custom APIs at:
+
+```
+https://ENDPOINT_ID.api.runpod.ai/PATH
+```
+
+For example, the load balancing worker we defined in step 1 exposes these endpoints:
+
+- Health check: `https://ENDPOINT_ID.api.runpod.ai/ping`
+- Generate text: `https://ENDPOINT_ID.api.runpod.ai/generate`
+- Get request count: `https://ENDPOINT_ID.api.runpod.ai/stats`
+
+Try running one or more of these commands, replacing `ENDPOINT_ID` and `RUNPOD_API_KEY` with your actual endpoint ID and API key:
+
+<CodeGroup>
+
+```bash generate
+curl -X POST "https://ENDPOINT_ID.api.runpod.ai/generate" \
+    -H 'Authorization: Bearer RUNPOD_API_KEY' \
+    -H "Content-Type: application/json" \
+    -d '{"prompt": "Hello, world!"}'
+```
+
+```bash ping
+curl -X GET "https://ENDPOINT_ID.api.runpod.ai/ping" \
+    -H 'Authorization: Bearer RUNPOD_API_KEY' \
+    -H "Content-Type: application/json" \
+```
+
+```bash stats
+curl -X GET "https://ENDPOINT_ID.api.runpod.ai/stats" \
+    -H 'Authorization: Bearer RUNPOD_API_KEY' \
+    -H "Content-Type: application/json" \
+```
+
+</CodeGroup>
+
+After sending a request, your workers will take some time to initialize. You can track their progress by checking the logs in the **Workers** tab of your endpoint page.
+
+<Tip>
+If you see: `{"error":"no workers available"}%` after running the request, this means your workers did not initialize in time to process it. If you try running the request again, this will usually resolve the issue.
+
+For production applications, implement a health check with retries before sending requests. See [Handling cold start errors](/serverless/load-balancing/overview#handling-cold-start-errors) for a complete code example.
+</Tip>
+
+<Check>
+Congratulations! You've successfully deployed and tested a load balancing endpoint. If you want to use a real model, you can follow the [vLLM worker](/serverless/load-balancing/vllm-worker) tutorial.
+</Check>
+
+## (Optional) Advanced endpoint definitions
+
+For a more complex API, you can define multiple endpoints and organize them logically. Here's an example of how to structure a more complex API:
+
+```python
+from fastapi import FastAPI, HTTPException, Depends, Query
+from pydantic import BaseModel
+import os
+
+app = FastAPI()
+
+# --- Authentication middleware ---
+def verify_api_key(api_key: str = Query(None, alias="api_key")):
+    if api_key != os.getenv("API_KEY", "test_key"):
+        raise HTTPException(401, "Invalid API key")
+    return api_key
+
+# --- Models ---
+class TextRequest(BaseModel):
+    text: str
+    max_length: int = 100
+
+class ImageRequest(BaseModel):
+    prompt: str
+    width: int = 512
+    height: int = 512
+
+# --- Text endpoints ---
+@app.post("/v1/text/summarize")
+async def summarize(request: TextRequest, api_key: str = Depends(verify_api_key)):
+    # Implement text summarization
+    return {"summary": f"Summary of: {request.text[:30]}..."}
+
+@app.post("/v1/text/translate")
+async def translate(request: TextRequest, target_lang: str, api_key: str = Depends(verify_api_key)):
+    # Implement translation
+    return {"translation": f"Translation to {target_lang}: {request.text[:30]}..."}
+
+# --- Image endpoints ---
+@app.post("/v1/image/generate")
+async def generate_image(request: ImageRequest, api_key: str = Depends(verify_api_key)):
+    # Implement image generation
+    return {"image_url": f"https://example.com/images/{hash(request.prompt)}.jpg"}
+
+# --- Health check ---
+@app.get("/ping")
+async def health_check():
+    return {"status": "healthy"}
+
+```
+
+## (Optional) WebSocket support
+
+Load balancing endpoints also support WebSocket connections. This section shows how to add a WebSocket endpoint to your worker and connect to it from a client.
+
+<Tip>
+You can clone the [worker-lb-websocket repository](https://github.com/runpod-workers/worker-lb-websocket) for a complete working example, including scaling tests.
+</Tip>
+
+### Add a WebSocket endpoint
+
+WebSocket endpoints in FastAPI use the `@app.websocket()` decorator. Add the following to your `app.py`:
+
+```python app.py
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import asyncio
+
+app = FastAPI()
+
+# Track active connections
+active_ws_connections: list[WebSocket] = []
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """Streaming WebSocket endpoint.
+
+    Clients send JSON messages like: {"prompt": "Hello", "max_tokens": 50}
+    Server streams responses back and sends {"done": true} when complete.
+    """
+    await websocket.accept()
+    active_ws_connections.append(websocket)
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            prompt = data.get("prompt", "")
+
+            if not prompt:
+                await websocket.send_json({"error": "prompt is required"})
+                continue
+
+            # Simulate streaming response (replace with your model)
+            words = f"Response to: {prompt}".split()
+            for i, word in enumerate(words):
+                await websocket.send_json({"token": word, "index": i})
+                await asyncio.sleep(0.05)  # Simulate inference latency
+
+            await websocket.send_json({"done": True})
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        active_ws_connections.remove(websocket)
+```
+
+### Connect from a client
+
+When connecting to a WebSocket endpoint on a load balancing worker, you must set the `open_timeout` parameter to allow time for workers to scale up. The default timeout of 5 seconds is usually not enough.
+
+```python client.py
+import asyncio
+import json
+import websockets
+
+async def connect_to_worker():
+    url = "wss://ENDPOINT_ID.api.runpod.ai/ws"
+    headers = [("Authorization", "Bearer RUNPOD_API_KEY")]
+
+    # Set open_timeout to allow workers time to scale up (default is ~5s)
+    async with websockets.connect(
+        url,
+        additional_headers=headers,
+        open_timeout=60.0,  # Wait up to 60 seconds for connection
+    ) as ws:
+        # Send a request
+        await ws.send(json.dumps({"prompt": "Hello, world!", "max_tokens": 50}))
+
+        # Receive streaming response
+        while True:
+            response = json.loads(await ws.recv())
+            if response.get("done"):
+                print("Generation complete")
+                break
+            print(response.get("token", ""), end=" ")
+
+asyncio.run(connect_to_worker())
+```
+
+<Warning>
+If you don't set `open_timeout`, connections will fail with a timeout error when workers need to scale up from zero. A value of 60 seconds works for most use cases.
+</Warning>
+
+### Update requirements.txt
+
+Add the `websockets` library to your client's dependencies:
+
+```
+websockets==14.2
+```
+
+## Troubleshooting
+
+Here are some common issues and methods for troubleshooting:
+
+- **No workers available**: If your request returns `{"error":"no workers available"}%`, this means means your workers did not initialize in time to process the request. Running the request again will usually fix this issue.
+- **Worker unhealthy**: Check your health endpoint implementation and ensure it's returning proper status codes.
+- **API not accessible**: If your request returns `{"error":"not allowed for QB API"}`, verify that your endpoint type is set to "Load Balancer".
+- **Port issues**: Make sure the environment variable for `PORT` matches what your application is using, and that the `PORT_HEALTH` variable is set to a different port.
+- **Model errors**: Check your model's requirements and whether it's compatible with your GPU.
+- **WebSocket timeout**: If WebSocket connections fail with timeout errors, increase the `open_timeout` parameter in your client code to allow workers time to scale up. See [(Optional) WebSocket support](#optional-websocket-support) for details.
+
+## Next steps
+
+Now that you've learned how to build a basic load balancing worker, you can try [implementing a real model with vLLM](/serverless/load-balancing/vllm-worker).
+
+
+https://raw.githubusercontent.com/runpod-workers/worker-template/main/README.md
+![RunPod Worker Template](https://cpjrphpz3t5wbwfe.public.blob.vercel-storage.com/worker-template_banner-zUuCAjwDuvfsINR6vKBhYvvm3TnZFB.jpeg)
+
+---
+
+This repository serves as a starting point for creating your own custom RunPod Serverless worker. It provides a basic structure and configuration that you can build upon.
+
+---
+
+[![RunPod](https://api.runpod.io/badge/runpod-workers/worker-template)](https://www.runpod.io/console/hub/runpod-workers/worker-template)
+
+---
+
+## Getting Started
+
+1.  **Use this template:** Create a new repository based on this template or clone it directly.
+2.  **Customize:** Modify the code and configuration files to implement your specific task.
+3.  **Test:** Run your worker locally to ensure it functions correctly.
+4.  **Deploy:** Connect your repository to RunPod or build and push the Docker image manually.
+
+## Customizing Your Worker
+
+- **`handler.py`:** This is the core of your worker.
+  - The `handler(event)` function is the entry point executed for each job.
+  - The `event` dictionary contains the job input under the `"input"` key.
+  - Modify this function to load your models, process the input and return the desired output.
+  - Consider implementing model loading outside the handler (e.g., globally or in an initialization function) if models are large and reused across jobs.
+- **`requirements.txt`:** Add any Python libraries your worker needs to this file. These will be installed via `uv` when the Docker image is built.
+- **`Dockerfile`:**
+  - This file defines the Docker image for your worker.
+  - It starts from a [RunPod base image (`runpod/base`)](https://github.com/runpod/containers/tree/main/official-templates/base) which includes CUDA, mulitple versions of python, uv, jupyter notebook and common dependencies.
+  - It installs dependencies from `requirements.txt` using `uv`.
+  - It copies your `src` directory into the image.
+  - You might need to add system dependencies (`apt-get install ...`), environment variables (`ENV`), or other setup steps here if required by your specific application.
+- **`test_input.json`:** Modify this file to provide relevant sample input for local testing.
+
+## Testing Locally
+
+You can test your handler logic locally using the RunPod Python SDK. For detailed steps on setting up your local environment (creating a virtual environment, installing dependencies) and running the handler, please refer to the [RunPod Serverless Get Started Guide](https://docs.runpod.io/serverless/get-started).
+
+1.  **Prepare Input:** Modify `test_input.json` with relevant sample input for your handler.
+2.  **Run the Handler:**
+    ```bash
+    python handler.py
+    ```
+    This will execute your `handler` function with the contents of [`test_input.json`](/test_input.json) as input.
+
+## Deploying to RunPod
+
+There are two main ways to deploy your worker:
+
+1.  **GitHub Integration (Recommended):**
+
+    - Connect your GitHub repository to RunPod Serverless. RunPod will automatically build and deploy your worker whenever you push changes to your specified branch.
+    - For detailed instructions on setting up the GitHub integration, authorizing RunPod, and configuring your deployment, please refer to the [RunPod Deploy with GitHub Guide](https://docs.runpod.io/serverless/github-integration).
+
+2.  **Manual Docker Build & Push:**
+    - For detailed instructions on building the Docker image locally and pushing it to a container registry, please see the [RunPod Serverless Get Started Guide](https://docs.runpod.io/serverless/get-started#step-6-build-and-push-your-docker-image).
+    - Once pushed, create a new Template or Endpoint in the RunPod Serverless UI and point it to the image in your container registry.
+
+## Further Information
+
+- [RunPod Serverless Documentation](https://docs.runpod.io/serverless/overview)
+- [Python SDK](https://github.com/runpod/runpod-python)
+- [Base Docker Images](https://github.com/runpod/containers/tree/main/official-templates/base)
+- [Community Discord](https://discord.gg/cUpRmau42Vd)
+
+
+https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/common/common.cpp
+1314:     }
+1315: 
+1316:     if (llama_model_classifier_free_guidance(model)) {
+1317:         params.kv_unified   = true;
+1318:         cparams.kv_unified  = true;
+1319:         cparams.n_seq_max  *= 2;
+1320:     }
+1321: 
+1322:     // embeddings need the whole batch in one ubatch, so n_batch must not be larger than n_ubatch
+1323:     // (server.cpp does this check for --embedding, but before the model is loaded)
+1370:     }
+1371: 
+1372:     // init the backend samplers as part of the context creation
+1373:     pimpl->samplers.resize(cparams.n_seq_max);
+1374:     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
+1375: 
+1376:     for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+1377:         pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
+1378:         pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
+1379:     }
+1380: 
+1739:     auto cparams = llama_context_default_params();
+1740: 
+1741:     cparams.n_ctx             = params.n_ctx;
+1742:     cparams.n_seq_max         = params.n_parallel;
+1743:     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+1744:     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+1745:     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+1746:     cparams.n_batch           = params.n_batch;
+1766:     cparams.no_perf           = params.no_perf;
+1767:     cparams.op_offload        = !params.no_op_offload;
+1768:     cparams.swa_full          = params.swa_full;
+1769:     cparams.kv_unified        = params.kv_unified;
+1770: 
+1771:     cparams.type_k = params.cache_type_k;
+1772:     cparams.type_v = params.cache_type_v;
+1773: 
+
+https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/src/llama-context.cpp
+184: 
+185:     const auto & hparams = model.hparams;
+186: 
+187:     cparams.n_seq_max = std::max(1u, params.n_seq_max);
+188:     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
+189:         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
+190:     }
+191: 
+192:     cparams.n_rs_seq = params.n_rs_seq;
+193:     if (cparams.n_rs_seq > 0 && (!llm_arch_supports_rs_rollback(model.arch) || !hparams.causal_attn)) {
+375:     }
+376: 
+377:     cparams.op_offload     = params.op_offload;
+378:     cparams.kv_unified     = params.kv_unified;
+379:     cparams.moe_cache_size      = params.moe_cache_size;
+380:     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+381: 
+382:     // resolved after flash attention, see resolve_fused_ops()
+385: 
+386:         const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
+387:         if (!LLAMA_KV_ROWS_DISABLE) {
+388:             cparams.auto_fkvr = cparams.kv_unified;
+389:         } else {
+390:             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
+391:             cparams.auto_fkvr = false;
+392:         }
+408:     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+409:     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+410: 
+411:     if (cparams.kv_unified) {
+412:         cparams.n_ctx_seq = cparams.n_ctx;
+413:     } else {
+414:         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
+415:         cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
+416: 
+417:         if (cparams.n_ctx_seq == 0) {
+418:             throw std::runtime_error("n_ctx_seq == 0");
+419:         }
+420: 
+421:         if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
+422:             cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
+423:             LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
+424:         }
+425:     }
+426: 
+427:     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
+428:     LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
+429:     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
+430:     LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
+431:     LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
+432:     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
+433:     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
+434:     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+435:     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
+436:     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
+437:     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
+438:     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
+439:     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
+440: 
+441:     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
+442:         LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
+443:                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
+444:     }
+445: 
+446:     if (cparams.n_ctx_seq > hparams.n_ctx_train) {
+447:         LLAMA_LOG_WARN("%s: n_ctx_seq (%u) > n_ctx_train (%u) -- possible training context overflow\n",
+448:                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
+449:     }
+450: 
+451:     {
+452:         const int64_t max_nodes = graph_max_nodes();
+518: 
+519:         // graph outputs buffer
+520:         {
+521:             if (output_reserve(params.n_seq_max) < params.n_seq_max) {
+522:                 throw std::runtime_error("failed to reserve initial output buffer");
+523:             }
+524: 
+525:             LLAMA_LOG_INFO("%s: %10s  output buffer size = %8.2f MiB\n", __func__,
+798: 
+799:     const int64_t t_start_us = ggml_time_us();
+800: 
+801:     const uint32_t n_seqs = cparams.n_seq_max;
+802:     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+803: 
+804:     const size_t max_nodes = this->graph_max_nodes();
+805: 
+1002:     return cparams.n_ctx;
+1003: }
+1004: 
+1005: uint32_t llama_context::n_ctx_seq() const {
+1006:     return cparams.n_ctx_seq;
+1007: }
+1008: 
+1009: uint32_t llama_context::n_batch() const {
+1010:     return cparams.n_batch;
+1014:     return cparams.n_ubatch;
+1015: }
+1016: 
+1017: uint32_t llama_context::n_seq_max() const {
+1018:     return cparams.n_seq_max;
+1019: }
+1020: 
+1021: uint32_t llama_context::n_threads() const {
+1022:     return cparams.n_threads;
+1074:             throw std::runtime_error("failed to initialize memory context");
+1075:         }
+1076: 
+1077:         const uint32_t n_seqs = cparams.n_seq_max;
+1078:         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+1079: 
+1080:         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+1081: 
+1587:     };
+1588:     ctx_h_nextn_dev.reset(ggml_init(params));
+1589: 
+1590:     h_nextn_dev = ggml_new_tensor_2d(ctx_h_nextn_dev.get(), GGML_TYPE_F32, model.hparams.n_embd_out(), cparams.n_batch + cparams.n_seq_max);
+1591:     ggml_set_name(h_nextn_dev, "h_nextn_dev");
+1592: 
+1593:     buf_h_nextn_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_h_nextn_dev.get(), ggml_backend_dev_buffer_type(h_nextn_dev_dev)));
+1594:     if (!buf_h_nextn_dev) {
+2177:     const bool embd_all     = output_all || !cparams.causal_attn;
+2178:     const bool has_samplers = !sampling.samplers.empty();
+2179: 
+2180:     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+2181: 
+2182:     // TODO: avoid this workaround in the future
+2183:     // embedding contexts output every token even when no token is explicitly marked as output
+2184:     if (has_samplers) {
+2185:         std::vector<int32_t> seq_output_count(n_seq_max, 0);
+2186: 
+2187:         for (const auto & tok : batch_inp.tokens) {
+2188:             if (!output_all && !tok.output) {
+2189:                 continue;
+2190:             }
+2191: 
+2192:             for (auto seq_id : tok.seq_ids) {
+2193:                 if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+2194:                     continue;
+2195:                 }
+2196: 
+2197:                 seq_output_count[seq_id]++;
+2618:     const auto & hparams = model.hparams;
+2619:     const auto & vocab   = model.vocab;
+2620: 
+2621:     const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
+2622: 
+2623:     const auto n_batch    = cparams.n_batch;
+2624:     const auto n_vocab    = vocab.n_tokens();
+2625:     const auto n_embd     = hparams.n_embd;
+4417:         /*.n_ctx                       =*/ 512,
+4418:         /*.n_batch                     =*/ 2048,
+4419:         /*.n_ubatch                    =*/ 512,
+4420:         /*.n_seq_max                   =*/ 1,
+4421:         /*.n_rs_seq                    =*/ 0,
+4422:         /*.n_outputs_max               =*/ 0,
+4423:         /*.n_outputs_max_per_seq       =*/ 1,
+4424:         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
+4448:         /*.no_perf                     =*/ true,
+4449:         /*.op_offload                  =*/ true,
+4450:         /*.swa_full                    =*/ true,
+4451:         /*.kv_unified                  =*/ false,
+4452:         /*.sampler                     =*/ nullptr,
+4453:         /*.n_sampler                   =*/ 0,
+4454:         /*.ctx_other                   =*/ nullptr,
+4455:     };
+4611:     return ctx->n_ctx();
+4612: }
+4613: 
+4614: uint32_t llama_n_ctx_seq(const llama_context * ctx) {
+4615:     return ctx->n_ctx_seq();
+4616: }
+4617: 
+4618: uint32_t llama_n_batch(const llama_context * ctx) {
+4619:     return ctx->n_batch();
+4623:     return ctx->n_ubatch();
+4624: }
+4625: 
+4626: uint32_t llama_n_seq_max(const llama_context * ctx) {
+4627:     return ctx->n_seq_max();
+4628: }
+4629: 
+4630: uint32_t llama_n_rs_seq(const llama_context * ctx) {
+4631:     return ctx->get_cparams().n_rs_seq;
+
+https://api.github.com/users/runners
+{"login": "Runners", "html_url": "https://github.com/Runners", "name": null, "company": null, "bio": null}
+
+https://api.github.com/repos/runpod/runpod-python/git/trees/main?recursive=1
+["docs/serverless", "docs/serverless/functions", "docs/serverless/functions/error_handling.md", "docs/serverless/functions/logging.md", "docs/serverless/gpu_binary_compilation.md", "docs/serverless/local_testing.md", "docs/serverless/utils", "docs/serverless/utils/rp_cleanup.md", "docs/serverless/utils/rp_debugger.md", "docs/serverless/utils/rp_download.md", "docs/serverless/utils/rp_upload.md", "docs/serverless/utils/rp_validator.md", "docs/serverless/volume_cache.md", "docs/serverless/worker.md", "docs/serverless/worker_fitness_checks.md", "docs/serverless/worker_realtime.md", "examples/endpoints/health.py", "examples/serverless", "examples/serverless/concurrent_handler.py", "examples/serverless/logger.py", "examples/serverless/simple_handler.py", "examples/serverless/volume_cache_handler.py", "runpod/_health", "runpod/_health/__init__.py", "runpod/_health/cuda.py", "runpod/_health/fitness.py", "runpod/_health/gpu.py", "runpod/_health/system.py", "runpod/apps/utils/http.py", "runpod/http_client.py", "runpod/serverless", "runpod/serverless/__init__.py", "runpod/serverless/binaries", "runpod/serverless/binaries/README.md", "runpod/serverless/binaries/__init__.py", "runpod/serverless/binaries/gpu_test", "runpod/serverless/modules", "runpod/serverless/modules/__init__.py", "runpod/serverless/modules/rp_capture.py", "runpod/serverless/modules/rp_fastapi.py", "runpod/serverless/modules/rp_fitness.py", "runpod/serverless/modules/rp_gpu_fitness.py", "runpod/serverless/modules/rp_handler.py", "runpod/serverless/modules/rp_http.py", "runpod/serverless/modules/rp_job.py", "runpod/serverless/modules/rp_local.py", "runpod/serverless/modules/rp_logger.py", "runpod/serverless/modules/rp_ping.py", "runpod/serverless/modules/rp_prestart.py", "runpod/serverless/modules/rp_progress.py", "runpod/serverless/modules/rp_scale.py", "runpod/serverless/modules/rp_system_fitness.py", "runpod/serverless/modules/rp_tips.py", "runpod/serverless/modules/worker_state.py", "runpod/serverless/utils", "runpod/serverless/utils/__init__.py", "runpod/serverless/utils/rp_cleanup.py", "runpod/serverless/utils/rp_cuda.py", "runpod/serverless/utils/rp_debugger.py", "runpod/serverless/utils/rp_download.py", "runpod/serverless/utils/rp_model_cache.py", "runpod/serverless/utils/rp_ssrf.py", "runpod/serverless/utils/rp_upload.py", "runpod/serverless/utils/rp_validator.py", "runpod/serverless/utils/rp_volume_cache.py", "runpod/serverless/worker.py", "tests/test_apps/test_http_errors.py", "tests/test_serverless", "tests/test_serverless/__init__.py", "tests/test_serverless/local_sim", "tests/test_serverless/local_sim/.env_example", "tests/test_serverless/local_sim/Makefile", "tests/test_serverless/local_sim/localhost.py", "tests/test_serverless/local_sim/worker.py", "tests/test_serverless/test_capture.py", "tests/test_serverless/test_init.py", "tests/test_serverless/test_integration_worker_state.py", "tests/test_serverless/test_modules", "tests/test_serverless/test_modules/__init__.py", "tests/test_serverless/test_modules/test_fastapi.py", "tests/test_serverless/test_modules/test_fitness", "tests/test_serverless/test_modules/test_fitness/__init__.py", "tests/test_serverless/test_modules/test_fitness/conftest.py", "tests/test_serverless/test_modules/test_fitness/test_force_kill.py", "tests/test_serverless/test_modules/test_fitness/test_gpu_checks.py", "tests/test_serverless/test_modules/test_fitness/test_gpu_integration.py", "tests/test_serverless/test_modules/test_fitness/test_registration.py", "tests/test_serverless/test_modules/test_fitness/test_safe_startup.py", "tests/test_serverless/test_modules/test_fitness/test_startup.py", "tests/test_serverless/test_modules/test_fitness/test_system_checks.py", "tests/test_serverless/test_modules/test_handler.py", "tests/test_serverless/test_modules/test_http.py", "tests/test_serverless/test_modules/test_job.py", "tests/test_serverless/test_modules/test_local.py", "tests/test_serverless/test_modules/test_logger.py", "tests/test_serverless/test_modules/test_ping.py", "tests/test_serverless/test_modules/test_progress.py", "tests/test_serverless/test_modules/test_scale.py", "tests/test_serverless/test_modules/test_state.py", "tests/test_serverless/test_modules/test_tips.py", "tests/test_serverless/test_prestart.py", "tests/test_serverless/test_prestart_lifecycle.py", "tests/test_serverless/test_refresh_worker.py", "tests/test_serverless/test_rp_scale.py", "tests/test_serverless/test_scale_mirror.py", "tests/test_serverless/test_utils", "tests/test_serverless/test_utils/__init__.py", "tests/test_serverless/test_utils/test_cleanup.py", "tests/test_serverless/test_utils/test_cuda.py", "tests/test_serverless/test_utils/test_debugger.py", "tests/test_serverless/test_utils/test_download.py", "tests/test_serverless/test_utils/test_model_cache.py", "tests/test_serverless/test_utils/test_rp_volume_cache.py", "tests/test_serverless/test_utils/test_ssrf.py", "tests/test_serverless/test_utils/test_upload.py", "tests/test_serverless/test_utils/test_validate.py", "tests/test_serverless/test_utils_init.py", "tests/test_serverless/test_worker.py"]
+
+
+web search: https://docs.runpod.io/serverless/load-balancing/build-a-worker
+web search: 
+web search: '204' in https://docs.runpod.io/serverless/load-balancing/build-a-worker
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "@'
+import urllib.request, json
+u='https://raw.githubusercontent.com/runpod/docs/main/serverless/load-balancing/build-a-worker.mdx'
+rows=urllib.request.urlopen(u,timeout=25).read().decode().splitlines()
+terms=['PORT','204','503','Health check','health check','Initializing','initializ']
+idx=sorted({j for i,s in enumerate(rows) if any(t in s for t in terms) for j in range(max(0,i-2),min(len(rows),i+5))})
+print('\\n'.join(f'{i+1}: {rows[i]}' for i in idx))
+print(json.loads(urllib.request.urlopen('https://api.github.com/repos/ggml-org/llama.cpp/git/ref/tags/b12359',timeout=25).read()))
+'@ | python -B -" in F:\TG Bot Bulid\team_llm
+ succeeded in 5594ms:
+47: request_count = 0
+48: 
+49: # Health check endpoint; required for Runpod to monitor worker health
+50: @app.get("/ping")
+51: async def health_check():
+52:     return {"status": "healthy"}
+53: 
+72:     import uvicorn
+73: 
+74:     port = int(os.getenv("PORT", 80))
+75:     print(f"Starting server on port {port}")
+76: 
+77:     # Start the server
+78:     uvicorn.run(app, host="0.0.0.0", port=port)
+81: This simple application defines the following endpoints:
+82: 
+83: - A health check endpoint at `/ping`
+84: - A text generation endpoint at `/generate`
+85: - A statistics endpoint at `/stats`
+86: 
+87: ## Step 2: Create a Dockerfile
+156: For example, the load balancing worker we defined in step 1 exposes these endpoints:
+157: 
+158: - Health check: `https://ENDPOINT_ID.api.runpod.ai/ping`
+159: - Generate text: `https://ENDPOINT_ID.api.runpod.ai/generate`
+160: - Get request count: `https://ENDPOINT_ID.api.runpod.ai/stats`
+161: 
+162: Try running one or more of these commands, replacing `ENDPOINT_ID` and `RUNPOD_API_KEY` with your actual endpoint ID and API key:
+185: </CodeGroup>
+186: 
+187: After sending a request, your workers will take some time to initialize. You can track their progress by checking the logs in the **Workers** tab of your endpoint page.
+188: 
+189: <Tip>
+190: If you see: `{"error":"no workers available"}%` after running the request, this means your workers did not initialize in time to process it. If you try running the request again, this will usually resolve the issue.
+191: 
+192: For production applications, implement a health check with retries before sending requests. See [Handling cold start errors](/serverless/load-balancing/overview#handling-cold-start-errors) for a complete code example.
+193: </Tip>
+194: 
+195: <Check>
+196: Congratulations! You've successfully deployed and tested a load balancing endpoint. If you want to use a real model, you can follow the [vLLM worker](/serverless/load-balancing/vllm-worker) tutorial.
+241:     return {"image_url": f"https://example.com/images/{hash(request.prompt)}.jpg"}
+242: 
+243: # --- Health check ---
+244: @app.get("/ping")
+245: async def health_check():
+246:     return {"status": "healthy"}
+247: 
+351: Here are some common issues and methods for troubleshooting:
+352: 
+353: - **No workers available**: If your request returns `{"error":"no workers available"}%`, this means means your workers did not initialize in time to process the request. Running the request again will usually fix this issue.
+354: - **Worker unhealthy**: Check your health endpoint implementation and ensure it's returning proper status codes.
+355: - **API not accessible**: If your request returns `{"error":"not allowed for QB API"}`, verify that your endpoint type is set to "Load Balancer".
+356: - **Port issues**: Make sure the environment variable for `PORT` matches what your application is using, and that the `PORT_HEALTH` variable is set to a different port.
+357: - **Model errors**: Check your model's requirements and whether it's compatible with your GPU.
+358: - **WebSocket timeout**: If WebSocket connections fail with timeout errors, increase the `open_timeout` parameter in your client code to allow workers time to scale up. See [(Optional) WebSocket support](#optional-websocket-support) for details.
+359: 
+360: ## Next steps
+{'ref': 'refs/tags/b12359', 'node_id': 'REF_kwDOJH_K4LByZWZzL3RhZ3MvYjEyMzU5', 'url': 'https://api.github.com/repos/ggml-org/llama.cpp/git/refs/tags/b12359', 'object': {'sha': 'b1b770d90d94cad9e9ea5b993bdbc383a522fb28', 'type': 'commit', 'url': 'https://api.github.com/repos/ggml-org/llama.cpp/git/commits/b1b770d90d94cad9e9ea5b993bdbc383a522fb28'}}
+
+web search: 
+web search: '204' in https://docs.runpod.io/serverless/load-balancing/overview
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "@'
+import urllib.request, concurrent.futures, json
+urls=[
+ 'https://raw.githubusercontent.com/runpod/docs/main/serverless/load-balancing/overview.mdx',
+ 'https://raw.githubusercontent.com/runpod/worker-load-balancer/main/README.md',
+ 'https://raw.githubusercontent.com/encode/starlette/0.42.0/starlette/responses.py',
+ 'https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/tools/server/server.cpp',
+ 'https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/tools/server/server-common.cpp',
+]
+def go(url):
+ try:
+  rows=urllib.request.urlopen(url,timeout=25).read().decode().splitlines()
+  if 'overview' in url:terms=['204','200','400','PORT','/ping','health']
+  elif 'responses.py' in url:terms=['class StreamingResponse'];
+  else:terms=['kv_unified', 'n_parallel <', 'auto_np']
+  hits=[i for i,s in enumerate(rows) if any(t in s for t in terms)]
+  after=85 if 'responses.py' in url else 6
+  idx=sorted({j for i in hits for j in range(max(0,i-3),min(len(rows),i+after))})
+  return url+'\\n'+'\\n'.join(f'{i+1}: {rows[i]}' for i in idx)
+ except Exception as e:return url+'\\n'+str(e)
+with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+ for s in ex.map(go,urls):print(s+'\\n')
+'@ | python -B -" in F:\TG Bot Bulid\team_llm
+ succeeded in 3519ms:
+https://raw.githubusercontent.com/runpod/docs/main/serverless/load-balancing/overview.mdx
+72: 
+73: app = FastAPI()
+74: 
+75: @app.get("/ping")
+76: async def health_check():
+77:     return {"status": "healthy"}
+78: 
+79: @app.post("/generate")
+80: async def generate(request: dict):
+81:     return {"generated_text": f"Generated text for: {request['prompt']}"}
+82: 
+83: if __name__ == "__main__":
+84:     import uvicorn
+85:     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "80")))
+86: ```
+87: 
+88: This exposes custom endpoints: `https://ENDPOINT_ID.api.runpod.ai/ping` and `https://ENDPOINT_ID.api.runpod.ai/generate`
+89: 
+90: ## Health checks
+91: 
+92: Each worker exposes a health check endpoint on the `PORT_HEALTH` port, and the load balancer polls it periodically to decide whether the worker is healthy enough to receive traffic. By default the load balancer polls `/ping`, but you can point it at any path by setting the `HEALTH_CHECK_PATH` environment variable. This is useful when you deploy a public image whose server already exposes a health check at a different path, such as a `llama.cpp` image that serves `/health`, so you don't need to build a custom image just to satisfy the health check.
+93: 
+94: <Note>
+95: You can also set the health check path directly in the Runpod console when creating a new endpoint. The **Health check endpoint** field appears on the Configure image step. Leave it empty to use the default `/ping`.
+96: </Note>
+97: 
+98: The load balancer interprets the response code from the health check endpoint as follows:
+99: 
+100: | Response code | Status |
+101: |---------------|--------|
+102: | `200` | Healthy |
+103: | `204` | Initializing |
+104: | Other | Unhealthy |
+105: 
+106: Unhealthy workers are automatically removed from the routing pool.
+107: 
+108: <Note>
+109: 
+110: When calculating endpoint metrics, Runpod calculates the cold start time for load balancing workers by measuring the time it takes between the health check endpoint first returning `204` until it first returns `200`.
+111: 
+112: </Note>
+113: 
+114: 
+115: ## Environment variables
+116: 
+117: | Variable | Default | Description |
+118: |----------|---------|-------------|
+119: | `PORT` | `80` | Main application server port |
+120: | `PORT_HEALTH` | `80` | Health check endpoint port |
+121: | `HEALTH_CHECK_PATH` | `/ping` | Path the load balancer polls to check worker health |
+122: 
+123: Changing `PORT` doesn't change `PORT_HEALTH`: each defaults to `80` separately. If you set `PORT` to another port, set `PORT_HEALTH` too, usually to the same value. Otherwise the load balancer checks health on port 80, gets no answer, and the worker never becomes ready.
+124: 
+125: If using a custom port, add it to your endpoint's environment variables and expose it in container configuration (under **Expose HTTP Ports (Max 10)**).
+126: 
+127: ## Timeouts and limits
+128: 
+146: import requests
+147: import time
+148: 
+149: def health_check_with_retry(base_url, api_key, max_retries=3, delay=5):
+150:     headers = {"Authorization": f"Bearer {api_key}"}
+151: 
+152:     for attempt in range(max_retries):
+153:         try:
+154:             response = requests.get(f"{base_url}/ping", headers=headers, timeout=10)
+155:             if response.status_code == 200:
+156:                 return True
+157:         except Exception:
+158:             pass
+159:         if attempt < max_retries - 1:
+160:             time.sleep(delay)
+161:     return False
+162: 
+163: # Usage
+164: if health_check_with_retry("https://ENDPOINT_ID.api.runpod.ai", "RUNPOD_API_KEY"):
+165:     # Worker ready, send requests
+166:     pass
+167: ```
+168: 
+169: Use at least 3 retries with 5-10 second delays.
+
+https://raw.githubusercontent.com/runpod/worker-load-balancer/main/README.md
+HTTP Error 404: Not Found
+
+https://raw.githubusercontent.com/encode/starlette/0.42.0/starlette/responses.py
+208: ContentStream = typing.Union[AsyncContentStream, SyncContentStream]
+209: 
+210: 
+211: class StreamingResponse(Response):
+212:     body_iterator: AsyncContentStream
+213: 
+214:     def __init__(
+215:         self,
+216:         content: ContentStream,
+217:         status_code: int = 200,
+218:         headers: typing.Mapping[str, str] | None = None,
+219:         media_type: str | None = None,
+220:         background: BackgroundTask | None = None,
+221:     ) -> None:
+222:         if isinstance(content, typing.AsyncIterable):
+223:             self.body_iterator = content
+224:         else:
+225:             self.body_iterator = iterate_in_threadpool(content)
+226:         self.status_code = status_code
+227:         self.media_type = self.media_type if media_type is None else media_type
+228:         self.background = background
+229:         self.init_headers(headers)
+230: 
+231:     async def listen_for_disconnect(self, receive: Receive) -> None:
+232:         while True:
+233:             message = await receive()
+234:             if message["type"] == "http.disconnect":
+235:                 break
+236: 
+237:     async def stream_response(self, send: Send) -> None:
+238:         await send(
+239:             {
+240:                 "type": "http.response.start",
+241:                 "status": self.status_code,
+242:                 "headers": self.raw_headers,
+243:             }
+244:         )
+245:         async for chunk in self.body_iterator:
+246:             if not isinstance(chunk, (bytes, memoryview)):
+247:                 chunk = chunk.encode(self.charset)
+248:             await send({"type": "http.response.body", "body": chunk, "more_body": True})
+249: 
+250:         await send({"type": "http.response.body", "body": b"", "more_body": False})
+251: 
+252:     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+253:         spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
+254: 
+255:         if spec_version >= (2, 4):
+256:             try:
+257:                 await self.stream_response(send)
+258:             except OSError:
+259:                 raise ClientDisconnect()
+260:         else:
+261:             async with anyio.create_task_group() as task_group:
+262: 
+263:                 async def wrap(func: typing.Callable[[], typing.Awaitable[None]]) -> None:
+264:                     await func()
+265:                     task_group.cancel_scope.cancel()
+266: 
+267:                 task_group.start_soon(wrap, partial(self.stream_response, send))
+268:                 await wrap(partial(self.listen_for_disconnect, receive))
+269: 
+270:         if self.background is not None:
+271:             await self.background()
+272: 
+273: 
+274: class MalformedRangeHeader(Exception):
+275:     def __init__(self, content: str = "Malformed range header.") -> None:
+276:         self.content = content
+277: 
+278: 
+279: class RangeNotSatisfiable(Exception):
+280:     def __init__(self, max_size: int) -> None:
+281:         self.max_size = max_size
+282: 
+283: 
+284: _RANGE_PATTERN = re.compile(r"(\d*)-(\d*)")
+285: 
+286: 
+287: class FileResponse(Response):
+288:     chunk_size = 64 * 1024
+289: 
+290:     def __init__(
+291:         self,
+292:         path: str | os.PathLike[str],
+293:         status_code: int = 200,
+294:         headers: typing.Mapping[str, str] | None = None,
+295:         media_type: str | None = None,
+
+https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/tools/server/server.cpp
+126:             params.n_batch = params.n_ubatch;
+127:         }
+128: 
+129:         if (params.n_parallel < 0) {
+130:             SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+131: 
+132:             params.n_parallel = 4;
+133:             params.kv_unified = true;
+134:         }
+135:     }
+136: 
+137:     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
+138:     // or with -c 0 for max context
+139:     const bool ctx_pool_auto_sized = params.kv_unified_per_slot > 0 &&
+140:                                      params.n_ctx == 0 &&
+141:                                      (uint32_t) params.fit_params_min_ctx != UINT32_MAX;
+142: 
+143:     if (ctx_pool_auto_sized) {
+144:         params.n_ctx = params.n_parallel * params.kv_unified_per_slot;
+145:         SRV_INF("--kv-unified-per-slot: sizing KV pool to n_parallel * kv_unified_per_slot = %d * %d = %d\n", params.n_parallel,
+146:                 params.kv_unified_per_slot, params.n_ctx);
+147:     }
+148: 
+149:     // for consistency between server router mode and single-model mode, we set the same model name as alias
+150:     auto model_name = params.model.get_name();
+151:     if (params.model_alias.empty() && !model_name.empty()) {
+
+https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/tools/server/server-common.cpp
+
+
+
+codex
+RunPod 官方文档区分队列 worker 和 Load Balancing HTTP worker；后者的健康检查以 HTTP 204 表示初始化、200 表示就绪。指定的 `runners/runpod_worker` 仓库和镜像接口均返回 404，因此目前无法核实它的专用 `/health` 契约，也不能确认代码中“booting 必须返回 200”的注释有官方依据。流式实现则存在一个清理缺口：上游连接已打开、但响应生成器尚未开始时，断连可能绕过生成器里的 `finally`。
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "@'
+import ast, asyncio, json, pathlib, types, typing, urllib.request
+# Execute only the reviewed forward() and the official StreamingResponse class in memory.
+source=pathlib.Path('server.py').read_text(encoding='utf-8')
+tree=ast.parse(source)
+selected=[n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in ('forward','filtered_headers')]
+class BaseResponse:
+    charset='utf-8'
+    media_type=None
+    def __init__(self,content=None,status_code=200,headers=None,**kwargs):
+        self.content,self.status_code,self.headers=content,status_code,headers
+    def init_headers(self,headers): self.raw_headers=[]
+class ClientDisconnect(Exception): pass
+remote=urllib.request.urlopen('https://raw.githubusercontent.com/encode/starlette/0.42.0/starlette/responses.py',timeout=20).read().decode()
+cls=next(n for n in ast.parse(remote).body if isinstance(n,ast.ClassDef) and n.name=='StreamingResponse')
+namespace={'Response':BaseResponse,'typing':typing,'ClientDisconnect':ClientDisconnect}
+module=ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),cls],type_ignores=[])
+exec(compile(module,'starlette-0.42.0/responses.py','exec'),namespace)
+HTTPError=type('HTTPError',(Exception,),{})
+ns={'asyncio':asyncio,'json':json,'Request':object,'httpx':types.SimpleNamespace(HTTPError=HTTPError,TimeoutException=type('TimeoutException',(HTTPError,),{})),
+    'HOP_HEADERS':{'connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade','content-length'},
+    'LLAMA_URL':'http://127.0.0.1:8080','StreamingResponse':namespace['StreamingResponse'],'Response':BaseResponse,'JSONResponse':BaseResponse,'log':print,
+    'api_error':lambda message,status,kind=None:BaseResponse(message,status)}
+exec(compile(ast.Module(body=selected,type_ignores=[]),'server.py','exec'),ns)
+class Upstream:
+    def __init__(self,success=True):
+        self.is_success=success; self.status_code=200 if success else 400
+        self.headers={'content-type':'text/event-stream'}; self.closed=False; self.read_started=asyncio.Event()
+    async def aiter_raw(self):
+        yield b'data: test\\n\\n'
+        self.read_started.set()
+        await asyncio.sleep(3600)
+    async def aread(self): return b'{}'
+    async def aclose(self): self.closed=True
+class Client:
+    def __init__(self,up,waiting=False):self.up=up; self.waiting=waiting; self.started=asyncio.Event()
+    def build_request(self,*args,**kwargs):return object()
+    async def send(self,*args,**kwargs):
+        self.started.set()
+        if self.waiting:await asyncio.sleep(3600)
+        return self.up
+class Request:
+    method='POST'; headers={}; query_params=types.SimpleNamespace(multi_items=lambda:[])
+    async def body(self):return b'{\"stream\":true}'
+    def __init__(self,client):
+        self.app=types.SimpleNamespace(state=types.SimpleNamespace(client=client,supervisor=types.SimpleNamespace(ready=types.SimpleNamespace(is_set=lambda:True))))
+async def unused_receive():await asyncio.sleep(3600)
+async def run():
+    up=Upstream(); response=await ns['forward'](Request(Client(up)),'/v1/chat/completions')
+    async def fail_start(message):raise OSError('downstream disconnected before first iteration')
+    try:await response({'asgi':{'spec_version':'2.4'}},unused_receive,fail_start)
+    except ClientDisconnect:pass
+    print('disconnect_before_generator: upstream_closed =',up.closed)
+    await response.body_iterator.aclose()
+    print('even_aclose_unstarted_generator: upstream_closed =',up.closed)
+    await up.aclose()
+
+    up=Upstream(); response=await ns['forward'](Request(Client(up)),'/v1/chat/completions')
+    async def fail_body(message):
+        if message['type']=='http.response.body':raise OSError('downstream disconnected while sending chunk')
+    try:await response({'asgi':{'spec_version':'2.4'}},unused_receive,fail_body)
+    except ClientDisconnect:pass
+    print('disconnect_during_send: upstream_closed =',up.closed)
+    await response.body_iterator.aclose()
+    print('explicitly_close_started_generator: upstream_closed =',up.closed)
+
+    up=Upstream(); response=await ns['forward'](Request(Client(up)),'/v1/chat/completions')
+    async def consume():
+        async for chunk in response.body_iterator:pass
+    task=asyncio.create_task(consume()); await up.read_started.wait(); task.cancel()
+    try:await task
+    except asyncio.CancelledError:pass
+    await asyncio.sleep(0)
+    print('cancel_while_reading_upstream: upstream_closed =',up.closed)
+
+    up=Upstream(False); await ns['forward'](Request(Client(up)),'/v1/chat/completions')
+    print('non_success_body: upstream_closed =',up.closed)
+
+    up=Upstream(); client=Client(up,waiting=True); request=Request(client)
+    task=asyncio.create_task(ns['forward'](request,'/v1/chat/completions')); await client.started.wait()
+    print('before_upstream_headers: pending_without_downstream_monitor =',not task.done())
+    task.cancel()
+    try:await task
+    except asyncio.CancelledError:pass
+asyncio.run(run())
+'@ | python -B -" in F:\TG Bot Bulid\team_llm
+ exited 1 in 2030ms:
+Traceback (most recent call last):
+  File "<stdin>", line 17, in <module>
+TypeError: required field "lineno" missing from stmt
+
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "@'
+import ast, asyncio, json, pathlib, types, typing, urllib.request
+source=pathlib.Path('server.py').read_text(encoding='utf-8')
+selected=[n for n in ast.parse(source).body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in ('forward','filtered_headers')]
+class BaseResponse:
+    charset='utf-8'; media_type=None
+    def __init__(self,content=None,status_code=200,headers=None,**kwargs):self.content,self.status_code,self.headers=content,status_code,headers
+    def init_headers(self,headers):self.raw_headers=[]
+class ClientDisconnect(Exception):pass
+remote=urllib.request.urlopen('https://raw.githubusercontent.com/encode/starlette/0.42.0/starlette/responses.py',timeout=20).read().decode()
+cls=next(n for n in ast.parse(remote).body if isinstance(n,ast.ClassDef) and n.name=='StreamingResponse')
+namespace={'Response':BaseResponse,'typing':typing,'ClientDisconnect':ClientDisconnect}
+module=ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),cls],type_ignores=[]))
+exec(compile(module,'starlette-0.42.0/responses.py','exec'),namespace)
+HTTPError=type('HTTPError',(Exception,),{})
+ns={'asyncio':asyncio,'json':json,'Request':object,'httpx':types.SimpleNamespace(HTTPError=HTTPError,TimeoutException=type('TimeoutException',(HTTPError,),{})),
+    'HOP_HEADERS':{'connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade','content-length'},
+    'LLAMA_URL':'http://127.0.0.1:8080','StreamingResponse':namespace['StreamingResponse'],'Response':BaseResponse,'JSONResponse':BaseResponse,'log':print,
+    'api_error':lambda message,status,kind=None:BaseResponse(message,status)}
+exec(compile(ast.Module(body=selected,type_ignores=[]),'server.py','exec'),ns)
+class Upstream:
+    def __init__(self,success=True):
+        self.is_success=success; self.status_code=200 if success else 400
+        self.headers={'content-type':'text/event-stream'}; self.closed=False; self.read_started=asyncio.Event()
+    async def aiter_raw(self):
+        yield b'data: test\\n\\n'
+        self.read_started.set(); await asyncio.sleep(3600)
+    async def aread(self):return b'{}'
+    async def aclose(self):self.closed=True
+class Client:
+    def __init__(self,up,waiting=False):self.up=up; self.waiting=waiting; self.started=asyncio.Event()
+    def build_request(self,*args,**kwargs):return object()
+    async def send(self,*args,**kwargs):
+        self.started.set()
+        if self.waiting:await asyncio.sleep(3600)
+        return self.up
+class Request:
+    method='POST'; headers={}; query_params=types.SimpleNamespace(multi_items=lambda:[])
+    async def body(self):return b'{\"stream\":true}'
+    def __init__(self,client):self.app=types.SimpleNamespace(state=types.SimpleNamespace(client=client,supervisor=types.SimpleNamespace(ready=types.SimpleNamespace(is_set=lambda:True))))
+async def unused_receive():await asyncio.sleep(3600)
+async def run():
+    up=Upstream(); response=await ns['forward'](Request(Client(up)),'/v1/chat/completions')
+    async def fail_start(message):raise OSError('downstream disconnected before first iteration')
+    try:await response({'asgi':{'spec_version':'2.4'}},unused_receive,fail_start)
+    except ClientDisconnect:pass
+    print('disconnect_before_generator: upstream_closed =',up.closed)
+    await response.body_iterator.aclose()
+    print('even_aclose_unstarted_generator: upstream_closed =',up.closed)
+    await up.aclose()
+    up=Upstream(); response=await ns['forward'](Request(Client(up)),'/v1/chat/completions')
+    async def fail_body(message):
+        if message['type']=='http.response.body':raise OSError('downstream disconnected while sending chunk')
+    try:await response({'asgi':{'spec_version':'2.4'}},unused_receive,fail_body)
+    except ClientDisconnect:pass
+    print('disconnect_during_send: upstream_closed =',up.closed)
+    await response.body_iterator.aclose()
+    print('explicitly_close_started_generator: upstream_closed =',up.closed)
+    up=Upstream(); response=await ns['forward'](Request(Client(up)),'/v1/chat/completions')
+    async def consume():
+        async for chunk in response.body_iterator:pass
+    task=asyncio.create_task(consume()); await up.read_started.wait(); task.cancel()
+    try:await task
+    except asyncio.CancelledError:pass
+    await asyncio.sleep(0)
+    print('cancel_while_reading_upstream: upstream_closed =',up.closed)
+    up=Upstream(False); await ns['forward'](Request(Client(up)),'/v1/chat/completions')
+    print('non_success_body: upstream_closed =',up.closed)
+    up=Upstream(); client=Client(up,waiting=True); task=asyncio.create_task(ns['forward'](Request(client),'/v1/chat/completions')); await client.started.wait()
+    print('before_upstream_headers: pending_without_downstream_monitor =',not task.done())
+    task.cancel()
+    try:await task
+    except asyncio.CancelledError:pass
+asyncio.run(run())
+'@ | python -B -" in F:\TG Bot Bulid\team_llm
+ succeeded in 2204ms:
+disconnect_before_generator: upstream_closed = False
+even_aclose_unstarted_generator: upstream_closed = False
+disconnect_during_send: upstream_closed = False
+explicitly_close_started_generator: upstream_closed = True
+cancel_while_reading_upstream: upstream_closed = True
+non_success_body: upstream_closed = True
+before_upstream_headers: pending_without_downstream_monitor = True
+
+web search: 
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "python -B -c \"import importlib.util as u; print({p:bool(u.find_spec(p)) for p in ['httpx','starlette','fastapi','anyio','uvicorn']})\"; @'
+import urllib.request, concurrent.futures, json
+urls=[
+ 'https://raw.githubusercontent.com/encode/uvicorn/0.30.6/uvicorn/protocols/http/h11_impl.py',
+ 'https://raw.githubusercontent.com/encode/uvicorn/master/uvicorn/protocols/http/h11_impl.py',
+ 'https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/tools/server/README.md',
+ 'https://api.github.com/repos/runners/runpod_worker',
+ 'https://api.github.com/repos/runpod/runners',
+ 'https://api.github.com/search/repositories?q=runpod_worker+user:runners',
+]
+def go(url):
+ try:
+  data=urllib.request.urlopen(url,timeout=20).read().decode()
+  if 'README.md' in url:
+   rows=data.splitlines(); data='\\n'.join(f'{i+1}: {s}' for i,s in enumerate(rows) if any(t in s for t in ['--flash-attn', '--kv-unified', '--spec-type','--spec-draft-n-max','--parallel']))
+  elif 'h11_impl' in url:
+   rows=data.splitlines(); terms=['spec_version','if self.disconnected','self.disconnected = True','http.disconnect']; hits=[i for i,s in enumerate(rows) if any(t in s for t in terms)];idx=sorted({j for i in hits for j in range(max(0,i-1),min(len(rows),i+4))});data='\\n'.join(f'{i+1}: {rows[i]}' for i in idx)
+  elif '/search/' in url:
+   o=json.loads(data);data=json.dumps({'total_count':o['total_count'],'items':[p['full_name'] for p in o['items']]})
+  return url+'\\n'+data
+ except Exception as e:return url+'\\n'+str(e)
+with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+ for s in ex.map(go,urls):print(s+'\\n')
+'@ | python -B -" in F:\TG Bot Bulid\team_llm
+ succeeded in 3126ms:
+{'httpx': False, 'starlette': False, 'fastapi': False, 'anyio': False, 'uvicorn': False}
+https://raw.githubusercontent.com/encode/uvicorn/0.30.6/uvicorn/protocols/http/h11_impl.py
+204:                         "version": self.config.asgi_version,
+205:                         "spec_version": "2.4",
+206:                     },
+207:                     "http_version": event.http_version.decode("ascii"),
+208:                     "server": self.server,
+455: 
+456:         if self.disconnected:
+457:             return  # pragma: full coverage
+458: 
+459:         if not self.response_started:
+536: 
+537:         if self.disconnected or self.response_complete:
+538:             return {"type": "http.disconnect"}
+539: 
+540:         message: HTTPRequestEvent = {
+541:             "type": "http.request",
+
+https://raw.githubusercontent.com/encode/uvicorn/master/uvicorn/protocols/http/h11_impl.py
+208:                     "type": "http",
+209:                     "asgi": {"version": self.asgi_version, "spec_version": "2.3"},
+210:                     "http_version": event.http_version.decode("ascii"),
+211:                     "server": self.server,
+212:                     "client": self.client,
+454: 
+455:         if self.disconnected:
+456:             return  # pragma: full coverage
+457: 
+458:         if not self.response_started:
+530: 
+531:         if self.disconnected or self.response_complete:
+532:             return {"type": "http.disconnect"}
+533: 
+534:         message: HTTPRequestEvent = {"type": "http.request", "body": bytes(self.body), "more_body": self.more_body}
+535:         self.body = bytearray()
+
+https://raw.githubusercontent.com/ggml-org/llama.cpp/b12359/tools/server/README.md
+56: | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
+166: | `--kv-unified-per-slot N` | context limit per parallel slot (default: unset, behavior unchanged).<br/>when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N<br/>(env: LLAMA_ARG_KV_UNIFIED_PER_SLOT) |
+170: | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
+178: | `-np, --parallel N` | number of server slots (default: -1, -1 = auto)<br/>(env: LLAMA_ARG_N_PARALLEL) |
+268: | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
+280: | `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
+293: | `--draft, --draft-n, --draft-max N` | the argument has been removed. use --spec-draft-n-max or --spec-ngram-mod-n-max<br/>(env: LLAMA_ARG_DRAFT_MAX) |
+1026: - `total_slots` - the total number of slots for process requests (defined by `--parallel` option)
+
+https://api.github.com/repos/runners/runpod_worker
+HTTP Error 404: Not Found
+
+https://api.github.com/repos/runpod/runners
+HTTP Error 404: Not Found
+
+https://api.github.com/search/repositories?q=runpod_worker+user:runners
+{"total_count": 0, "items": []}
+
+
+web search: https://raw.githubusercontent.com/encode/starlette/0.42.0/starlette/responses.py
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "@'
+import hashlib, pathlib, urllib.request, concurrent.futures
+urls={
+ 'arg':'https://raw.githubusercontent.com/ggml-org/llama.cpp/b1b770d90d94cad9e9ea5b993bdbc383a522fb28/common/arg.cpp',
+ 'model':'https://raw.githubusercontent.com/ggml-org/llama.cpp/b1b770d90d94cad9e9ea5b993bdbc383a522fb28/common/speculative.cpp',
+ 'server':'https://raw.githubusercontent.com/ggml-org/llama.cpp/b1b770d90d94cad9e9ea5b993bdbc383a522fb28/tools/server/server.cpp',
+ 'context':'https://raw.githubusercontent.com/ggml-org/llama.cpp/b1b770d90d94cad9e9ea5b993bdbc383a522fb28/src/llama-context.cpp',
+}
+terms={'arg':['--spec-draft-max','--spec-draft-n-max','\"-n\",','--flash-attn','--spec-type','--draft-n'], 'model':['\"draft-mtp\"'], 'server':['n_parallel < 0','kv_unified = true'], 'context':['if (cparams.kv_unified)', 'n_ctx_seq = cparams.n_ctx /']}
+def go(item):
+ name,url=item; rows=urllib.request.urlopen(url,timeout=25).read().decode().splitlines()
+ hits=[i for i,s in enumerate(rows) if any(t in s for t in terms[name])]
+ idx=sorted({j for i in hits for j in range(max(0,i-1),min(len(rows),i+3))})
+ return name+'\\n'+'\\n'.join(f'{i+1}: {rows[i]}' for i in idx)
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+ for s in ex.map(go,urls.items()):print(s+'\\n')
+path=pathlib.Path('server.py'); ast_source=path.read_bytes()
+print('server.py SHA256',hashlib.sha256(ast_source).hexdigest())
+compile(ast_source,str(path),'exec')
+print('syntax OK; no import or child process started')
+'@ | python -B -; git diff -- server.py" in F:\TG Bot Bulid\team_llm
+ succeeded in 4161ms:
+arg
+571:     // infer the speculative type from the draft GGUF metadata when none is requested
+572:     // note: reads only the first split - sharded drafts need an explicit --spec-type
+573:     if (spec_types_is_default(params) && !params.speculative.draft.mparams.path.empty()) {
+574:         const auto types_gguf = common_speculative_types_from_gguf(params.speculative.draft.mparams.path);
+837:             if (!seen_args.insert(arg).second) {
+838:                 const bool skip = (arg == "--spec-type");
+839: 
+840:                 if (!skip) {
+1230:         if (!seen_args.insert(arg).second) {
+1231:             const bool skip = (arg == "--spec-type");
+1232: 
+1233:             if (!skip) {
+1628:     add_opt(common_arg(
+1629:         {"-n", "--predict", "--n-predict"}, "N",
+1630:         string_format(
+1631:             ex == LLAMA_EXAMPLE_COMPLETION
+1725:     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_RETRIEVAL}));
+1726:     add_opt(common_arg({ "-fa", "--flash-attn" }, "[on|off|auto]",
+1727:                        string_format("set Flash Attention use ('on', 'off', or 'auto', default: '%s')",
+1728:                                      llama_flash_attn_type_name(params.flash_attn_type)),
+1737:                                throw std::runtime_error(
+1738:                                    string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
+1739:                            }
+1740:                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
+4182:     add_opt(common_arg(
+4183:         {"--spec-draft-n-max"}, "N",
+4184:         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+4185:         [](common_params & params, int value) {
+4316:     add_opt(common_arg(
+4317:         {"--spec-type"}, common_speculative_all_types_str(),
+4318:         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
+4319:             common_speculative_type_name_str(params.speculative.types).c_str()),
+4454:     add_opt(common_arg(
+4455:         {"--draft", "--draft-n", "--draft-max"}, "N",
+4456:         "the argument has been removed. use --spec-draft-n-max or --spec-ngram-mod-n-max",
+4457:         [](common_params & /*params*/, int /*value*/) {
+4458:             arg_removed("use --spec-draft-n-max or --spec-ngram-mod-n-max");
+4459:         }
+4460:     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
+4461:     add_opt(common_arg(
+4462:         {"--draft-min", "--draft-n-min"}, "N",
+4463:         "the argument has been removed. use --spec-draft-n-min or --spec-ngram-mod-n-min",
+4464:         [](common_params & /*params*/, int /*value*/) {
+
+model
+75:     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
+76:     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+77:     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
+78:     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
+2540:         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
+2541:         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+2542:         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
+2543:         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
+
+server
+128: 
+129:         if (params.n_parallel < 0) {
+130:             SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+131: 
+132:             params.n_parallel = 4;
+133:             params.kv_unified = true;
+134:         }
+135:     }
+
+context
+410: 
+411:     if (cparams.kv_unified) {
+412:         cparams.n_ctx_seq = cparams.n_ctx;
+413:     } else {
+414:         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
+415:         cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
+416: 
+
+server.py SHA256 9534a4e35d0564d6b033aeef609cff68bce6faf619d50cf496415966d0070de9
+syntax OK; no import or child process started
+
+codex
+内存复现支持这个清理缺口：在发送响应头或首个数据块时模拟断连，上游关闭标记仍为 False；在等待上游数据时取消迭代、以及读取非成功响应时，现有代码能关闭上游。源码也已确认：当前参数在未额外启用 `--kv-unified` 时，每个 slot 的上下文容量是 65,536 token，总量为 262,144。
+codex
+未修改文件。发现 **MTP 参数错误、SSE 连接清理缺口、首包前断连未处理**。指定 RunPod 模板的官方契约仍无法核实，不能据当前注释认定符合部署要求。
+
+**问题清单**
+
+1. **CRITICAL｜专用模板契约缺少可核验依据**  
+   位置：[server.py:1](<F:/TG Bot Bulid/team_llm/server.py:1>)、[server.py:242](<F:/TG Bot Bulid/team_llm/server.py:242>)、[server.py:357](<F:/TG Bot Bulid/team_llm/server.py:357>)；部署入口另见 [Dockerfile:52](<F:/TG Bot Bulid/team_llm/Dockerfile:52>)。  
+   实测 `runners/runpod_worker` 的 [GitHub API](https://api.github.com/repos/runners/runpod_worker) 和 [镜像接口](https://hub.docker.com/v2/repositories/runners/runpod-worker-cuda/) 均为 **404**。这不能证明其不存在，但意味着无法确认官方归属、8000 端口、四条路由及“booting 必须返回 200”的专用契约。Dockerfile 实际执行 `/handler/main.py`，它是否启动本文件也未证实。  
+   **修法：**取得可访问且固定版本的模板源码或镜像，核对 `/handler/main.py` 的启动、请求和健康检查协议，再据此适配。
+
+2. **CRITICAL（采用官方 Load Balancing 模式时）｜booting 返回 200 会被判断为健康**  
+   位置：[server.py:240](<F:/TG Bot Bulid/team_llm/server.py:240>)、[server.py:250](<F:/TG Bot Bulid/team_llm/server.py:250>)。  
+   当前 `/health` 在加载期间返回 `200 {"message":"booting"}`。官方 LB 按**状态码**判定：**200＝Healthy，204＝Initializing，其他＝Unhealthy**；JSON 中的 `booting` 不能阻止派发流量。[官方健康检查契约](https://docs.runpod.io/serverless/load-balancing/overview#health-checks)  
+   **修法：**若直接部署为官方 LB，初始化返回无正文的 `Response(status_code=204)`，就绪返回 200，并配置正确的健康检查路径。未知专用模板的要求需单独核实。
+
+3. **SHOULD｜启用 MTP 后必然遇到错误参数并退化为普通推理**  
+   位置：[server.py:91](<F:/TG Bot Bulid/team_llm/server.py:91>)、[server.py:191](<F:/TG Bot Bulid/team_llm/server.py:191>)、[server.py:195](<F:/TG Bot Bulid/team_llm/server.py:195>)。  
+   b12359 没有 `--spec-draft-max`，正确参数是 **`--spec-draft-n-max 4`**。当前 `SPEC_MTP=1` 时首次启动会失败，随后回退禁用 MTP；默认 `SPEC_MTP=0` 不触发此问题。[b12359 参数源码](https://github.com/ggml-org/llama.cpp/blob/b12359/common/arg.cpp#L4183)  
+   **修法：**替换参数名，并同步修正回退日志。
+
+4. **SHOULD｜SSE 清理依赖生成器运行，存在连接泄漏窗口**  
+   位置：[server.py:295](<F:/TG Bot Bulid/team_llm/server.py:295>)、[server.py:302](<F:/TG Bot Bulid/team_llm/server.py:302>)、[server.py:328](<F:/TG Bot Bulid/team_llm/server.py:328>)。  
+   上游连接先打开，成功流式响应在外层 `finally` 中跳过关闭，完全交给 `chunks()`。若发送响应头时断连，生成器尚未启动，其 `finally` 不执行；发送数据块时发生异常，也不保证立即关闭迭代器。连接可能持续占用连接池。HTTPX 要求手动流式模式保证最终执行 `aclose()`。[HTTPX 文档](https://www.python-httpx.org/async/#streaming-responses)  
+   **修法：**由自定义响应的 ASGI `__call__` 外层 `try/finally` 持有并关闭 `upstream`，清理使用取消屏蔽；覆盖未开始迭代、发送异常和取消路径。仅增加 `BackgroundTask` 不能覆盖所有异常路径。[Starlette 实现](https://github.com/encode/starlette/blob/0.42.0/starlette/responses.py#L252)
+
+5. **SHOULD｜等待上游响应头期间，没有下游断连监测**  
+   位置：[server.py:272](<F:/TG Bot Bulid/team_llm/server.py:272>)、[server.py:295](<F:/TG Bot Bulid/team_llm/server.py:295>)。  
+   请求体读取完成后直接等待 `client.send()`；此时 `StreamingResponse` 尚未返回，其断连处理尚未启动。客户端在排队或 prefill 时离开，当前代码仍可能继续等待并消耗上游资源。  
+   **修法：**并发监测 `http.disconnect`，断连后取消发送/读取任务，并在统一清理路径关闭已经取得的上游响应。
+
+**已核实的契约与正常项**
+
+| 检查项 | 核实结果 |
+|---|---|
+| RunPod 是否统一要求 FastAPI 监听 8000 | **没有该通用要求。**官方队列 worker 使用 `runpod.serverless.start({"handler": handler})`，无需自行实现这四条 HTTP 路由。[官方队列 worker 文档](https://docs.runpod.io/serverless/workers/handler-functions) |
+| 官方 LB 端口和路由 | `PORT`、`PORT_HEALTH` 分别默认 **80**；可配置为 8000，二者需与实际服务匹配。健康路径默认 `/ping`，可设置 `HEALTH_CHECK_PATH=/health`；业务路由自定义。[官方配置](https://docs.runpod.io/serverless/load-balancing/overview#environment-variables) |
+| 当前端口 | [server.py:357](<F:/TG Bot Bulid/team_llm/server.py:357>) 确实监听 `0.0.0.0:8000`；llama-server 在 `127.0.0.1:8080`。外部入口是否启动它仍待核实。 |
+| 当前四条路由 | 已实现 GET `/health`、POST `/handle_request`、GET `/ws`、GET `/get_status`。其中 [server.py:253](<F:/TG Bot Bulid/team_llm/server.py:253>) 的 `/ws` **只是 HTTP 占位接口，不是 WebSocket**；不能据路由名称判定协议合规。 |
+| `--spec-type draft-mtp` | **存在且拼写正确。**[b12359 speculative 源码](https://github.com/ggml-org/llama.cpp/blob/b12359/common/speculative.cpp#L76) |
+| Draft 数量参数 | 使用 `--spec-draft-n-max N`；`-n N` 控制生成 token 数。旧 `--draft`、`--draft-n`、`--draft-max` 在该版本已被移除。[参数源码](https://github.com/ggml-org/llama.cpp/blob/b12359/common/arg.cpp#L4455) |
+| Flash Attention | [server.py:73](<F:/TG Bot Bulid/team_llm/server.py:73>) 的 `on` 合法；**`on/off/auto` 三者均合法**，上游默认 `auto`。[b12359 README](https://github.com/ggml-org/llama.cpp/blob/b12359/tools/server/README.md) |
+| KV 容量与共享方式 | 当前显式 `--parallel 4 -c 262144`，未额外启用 unified 时，**按序列独立分配，每 slot 为 65,536 token**，总量 262,144。自动 slot 模式才会自动开启 unified；显式增加 `--kv-unified` 可改成共享总池。[server 默认处理](https://github.com/ggml-org/llama.cpp/blob/b12359/tools/server/server.cpp#L129)、[容量计算](https://github.com/ggml-org/llama.cpp/blob/b12359/src/llama-context.cpp#L411) |
+| HTTPX 正常路径 | 共享 `AsyncClient` 并在 lifespan 关闭；非流式分支有 `aclose()`；生成器已进入且在读取上游时被取消，会执行关闭；`aiter_raw()` 保留 SSE 原始字节。这些路径未发现遗漏关闭。 |
+
+验证采用只读源码检查、官方联网核验和内存模拟：复现了响应头/数据发送异常后的关闭缺口。语法检查通过；本机未安装完整服务依赖，未进行真实容器、网络断连或 GPU 推理测试。
+tokens used
+126,491
+未修改文件。发现 **MTP 参数错误、SSE 连接清理缺口、首包前断连未处理**。指定 RunPod 模板的官方契约仍无法核实，不能据当前注释认定符合部署要求。
+
+**问题清单**
+
+1. **CRITICAL｜专用模板契约缺少可核验依据**  
+   位置：[server.py:1](<F:/TG Bot Bulid/team_llm/server.py:1>)、[server.py:242](<F:/TG Bot Bulid/team_llm/server.py:242>)、[server.py:357](<F:/TG Bot Bulid/team_llm/server.py:357>)；部署入口另见 [Dockerfile:52](<F:/TG Bot Bulid/team_llm/Dockerfile:52>)。  
+   实测 `runners/runpod_worker` 的 [GitHub API](https://api.github.com/repos/runners/runpod_worker) 和 [镜像接口](https://hub.docker.com/v2/repositories/runners/runpod-worker-cuda/) 均为 **404**。这不能证明其不存在，但意味着无法确认官方归属、8000 端口、四条路由及“booting 必须返回 200”的专用契约。Dockerfile 实际执行 `/handler/main.py`，它是否启动本文件也未证实。  
+   **修法：**取得可访问且固定版本的模板源码或镜像，核对 `/handler/main.py` 的启动、请求和健康检查协议，再据此适配。
+
+2. **CRITICAL（采用官方 Load Balancing 模式时）｜booting 返回 200 会被判断为健康**  
+   位置：[server.py:240](<F:/TG Bot Bulid/team_llm/server.py:240>)、[server.py:250](<F:/TG Bot Bulid/team_llm/server.py:250>)。  
+   当前 `/health` 在加载期间返回 `200 {"message":"booting"}`。官方 LB 按**状态码**判定：**200＝Healthy，204＝Initializing，其他＝Unhealthy**；JSON 中的 `booting` 不能阻止派发流量。[官方健康检查契约](https://docs.runpod.io/serverless/load-balancing/overview#health-checks)  
+   **修法：**若直接部署为官方 LB，初始化返回无正文的 `Response(status_code=204)`，就绪返回 200，并配置正确的健康检查路径。未知专用模板的要求需单独核实。
+
+3. **SHOULD｜启用 MTP 后必然遇到错误参数并退化为普通推理**  
+   位置：[server.py:91](<F:/TG Bot Bulid/team_llm/server.py:91>)、[server.py:191](<F:/TG Bot Bulid/team_llm/server.py:191>)、[server.py:195](<F:/TG Bot Bulid/team_llm/server.py:195>)。  
+   b12359 没有 `--spec-draft-max`，正确参数是 **`--spec-draft-n-max 4`**。当前 `SPEC_MTP=1` 时首次启动会失败，随后回退禁用 MTP；默认 `SPEC_MTP=0` 不触发此问题。[b12359 参数源码](https://github.com/ggml-org/llama.cpp/blob/b12359/common/arg.cpp#L4183)  
+   **修法：**替换参数名，并同步修正回退日志。
+
+4. **SHOULD｜SSE 清理依赖生成器运行，存在连接泄漏窗口**  
+   位置：[server.py:295](<F:/TG Bot Bulid/team_llm/server.py:295>)、[server.py:302](<F:/TG Bot Bulid/team_llm/server.py:302>)、[server.py:328](<F:/TG Bot Bulid/team_llm/server.py:328>)。  
+   上游连接先打开，成功流式响应在外层 `finally` 中跳过关闭，完全交给 `chunks()`。若发送响应头时断连，生成器尚未启动，其 `finally` 不执行；发送数据块时发生异常，也不保证立即关闭迭代器。连接可能持续占用连接池。HTTPX 要求手动流式模式保证最终执行 `aclose()`。[HTTPX 文档](https://www.python-httpx.org/async/#streaming-responses)  
+   **修法：**由自定义响应的 ASGI `__call__` 外层 `try/finally` 持有并关闭 `upstream`，清理使用取消屏蔽；覆盖未开始迭代、发送异常和取消路径。仅增加 `BackgroundTask` 不能覆盖所有异常路径。[Starlette 实现](https://github.com/encode/starlette/blob/0.42.0/starlette/responses.py#L252)
+
+5. **SHOULD｜等待上游响应头期间，没有下游断连监测**  
+   位置：[server.py:272](<F:/TG Bot Bulid/team_llm/server.py:272>)、[server.py:295](<F:/TG Bot Bulid/team_llm/server.py:295>)。  
+   请求体读取完成后直接等待 `client.send()`；此时 `StreamingResponse` 尚未返回，其断连处理尚未启动。客户端在排队或 prefill 时离开，当前代码仍可能继续等待并消耗上游资源。  
+   **修法：**并发监测 `http.disconnect`，断连后取消发送/读取任务，并在统一清理路径关闭已经取得的上游响应。
+
+**已核实的契约与正常项**
+
+| 检查项 | 核实结果 |
+|---|---|
+| RunPod 是否统一要求 FastAPI 监听 8000 | **没有该通用要求。**官方队列 worker 使用 `runpod.serverless.start({"handler": handler})`，无需自行实现这四条 HTTP 路由。[官方队列 worker 文档](https://docs.runpod.io/serverless/workers/handler-functions) |
+| 官方 LB 端口和路由 | `PORT`、`PORT_HEALTH` 分别默认 **80**；可配置为 8000，二者需与实际服务匹配。健康路径默认 `/ping`，可设置 `HEALTH_CHECK_PATH=/health`；业务路由自定义。[官方配置](https://docs.runpod.io/serverless/load-balancing/overview#environment-variables) |
+| 当前端口 | [server.py:357](<F:/TG Bot Bulid/team_llm/server.py:357>) 确实监听 `0.0.0.0:8000`；llama-server 在 `127.0.0.1:8080`。外部入口是否启动它仍待核实。 |
+| 当前四条路由 | 已实现 GET `/health`、POST `/handle_request`、GET `/ws`、GET `/get_status`。其中 [server.py:253](<F:/TG Bot Bulid/team_llm/server.py:253>) 的 `/ws` **只是 HTTP 占位接口，不是 WebSocket**；不能据路由名称判定协议合规。 |
+| `--spec-type draft-mtp` | **存在且拼写正确。**[b12359 speculative 源码](https://github.com/ggml-org/llama.cpp/blob/b12359/common/speculative.cpp#L76) |
+| Draft 数量参数 | 使用 `--spec-draft-n-max N`；`-n N` 控制生成 token 数。旧 `--draft`、`--draft-n`、`--draft-max` 在该版本已被移除。[参数源码](https://github.com/ggml-org/llama.cpp/blob/b12359/common/arg.cpp#L4455) |
+| Flash Attention | [server.py:73](<F:/TG Bot Bulid/team_llm/server.py:73>) 的 `on` 合法；**`on/off/auto` 三者均合法**，上游默认 `auto`。[b12359 README](https://github.com/ggml-org/llama.cpp/blob/b12359/tools/server/README.md) |
+| KV 容量与共享方式 | 当前显式 `--parallel 4 -c 262144`，未额外启用 unified 时，**按序列独立分配，每 slot 为 65,536 token**，总量 262,144。自动 slot 模式才会自动开启 unified；显式增加 `--kv-unified` 可改成共享总池。[server 默认处理](https://github.com/ggml-org/llama.cpp/blob/b12359/tools/server/server.cpp#L129)、[容量计算](https://github.com/ggml-org/llama.cpp/blob/b12359/src/llama-context.cpp#L411) |
+| HTTPX 正常路径 | 共享 `AsyncClient` 并在 lifespan 关闭；非流式分支有 `aclose()`；生成器已进入且在读取上游时被取消，会执行关闭；`aiter_raw()` 保留 SSE 原始字节。这些路径未发现遗漏关闭。 |
+
+验证采用只读源码检查、官方联网核验和内存模拟：复现了响应头/数据发送异常后的关闭缺口。语法检查通过；本机未安装完整服务依赖，未进行真实容器、网络断连或 GPU 推理测试。
